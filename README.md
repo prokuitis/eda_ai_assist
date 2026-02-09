@@ -49,7 +49,7 @@ export GEMINI_API_KEY="your-api-key"
 ```
 
 ### Provider Selection
-Ash defaults to Gemini but is designed to support additional providers later:
+Ash defaults to Gemini but is designed to support additional providers such as Azure OpenAI in the future:
 
 ```
 export ASH_PROVIDER="gemini"
@@ -61,8 +61,23 @@ Run Ash with a prompt:
 ```
 ash "Explain clock domain crossing"
 ```
+```
+ash "Summarize the worst setup timing violations in file post_route_timing.rpt"
+```
 
-Ash will load provider configuration, resolve credentials, and send the request to the selected model.
+Run Ash in a build script:
+
+```
+ash "analyze simulation1.vcd and find when in time the signal fault_int asserts. Output to file results.txt"
+```
+
+Run Ash as a shell wrapper:
+
+```
+[ash]:/home/khubbard% summarize file top.v
+```
+
+On each prompt, Ash will load provider configuration, resolve credentials, and send the request to the selected model.
 
 ## Security Model
 Ash is designed for environments where multiple users may share a system. Key security features include:
