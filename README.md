@@ -3,7 +3,7 @@ AI assisted Shell, aka "Ash". Wraps around your existing shell and brings AI-LLM
 
 # Ash CLI Assistant
 
-Ash is a command-line AI assistant designed for engineers who value clarity, predictability, and operational safety. It provides a clean interface for interacting with AI models while maintaining strict control over credentials, logging, and multi-user behavior.
+Ash is a command‑line AI assistant designed for hardware engineers who work with large EDA artifacts. It wraps around your existing shell and brings modern AI/LLM capabilities directly into Linux/UNIX terminals and Windows PowerShell. Ash emphasizes clarity, predictability, and operational safety — with strict control over credentials, logging, and multi‑user behavior.
 
 ## Features
 - Simple CLI interface for sending prompts to AI models
@@ -59,10 +59,10 @@ export ASH_PROVIDER="gemini"
 Run Ash with a prompt:
 
 ```
-ash "Explain clock domain crossing"
+ash Explain clock domain crossing
 ```
 ```
-ash "Summarize the worst setup timing violations in file post_route_timing.rpt"
+ash Summarize the worst setup timing violations in file post_route_timing.rpt
 ```
 
 Run Ash in a build script:
@@ -76,6 +76,17 @@ Run Ash as a shell wrapper:
 ```
 [ash]:/home/khubbard% summarize file top.v
 ```
+
+Using Ash as a Python API:
+
+```
+from eda_ai_assist import api_eda_ai_assist
+
+ash = api_eda_ai_assist()
+result = ash.ask_ai("Summarize this file top.sdc")
+print(result)
+```
+
 
 On each prompt, Ash will load provider configuration, resolve credentials, and send the request to the selected model.
 
