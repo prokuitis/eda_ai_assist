@@ -17,51 +17,14 @@
 #
 # This is part of SUMP3 project: https://github.com/blackmesalabs/sump3
 # The technical name is eda_ai_assist but the ChatBot is known as Ash.
-#
-# Env Setup Linux
-#   set ash_path = ~/blah/python/cpy
-#   alias ash '$ash_path/eda_ai_assist.py'
-#  ~/.bashrc
-#    export GEMINI_API_KEY=12345678
-# Env Setup DOS
-#  [ash.bat]
-#  @echo off
-#  C:\python310\python.exe "C:\foo\cpy\eda_ai_assist.py" %*
-#  setx GEMINI_API_KEY "12345678"
-#
-# [ site_prompt.txt ]
-#   In plain text only.
-#   Use US number formatting for large values.
-#   Avoid markdown unless explicitly requested.
-#   Prefer concise answers and avoid emojis.
-#
-# @echo off
-# python "%ASH_DIR%\ash.py" %*
-#######################################
-# Linux / macOS
-#  export ASH_API_KEY="mykey123"
-#  export ASH_MODEL="gemini-2.5-flash"
-#  export ASH_PROVIDER="gemini"
-#  export ASH_DIR="$HOME/.ash"
-#  export ASH_USER_PROMPT="Please address me as Ser Kevin."
-# Windows (PowerShell) ash.bat file
-#  setx ASH_API_KEY "mykey123"
-#  setx ASH_MODEL "gemini-2.5-pro"
-#  setx ASH_DIR "C:\Users\Kevin\.ash\logs"
-#
-# History:
-#  2026.02.07 : khubbard : Created, forked from original sump_ai.py. Added CLI
-#  2026.02.11 : khubbard : Added paste buffer with threading timeout.
-#  2026.02.15 : khubbard : Refactoring. Started to add Azure support (incomplete)
-#
-# TODO: Consider replacing os.getlogin with getpass.getuser()
+
+# TODO: Hookup find_old_ash_files() to a cloud file cleanup routine.
 ########################################################################
-ASH_VERSION = "1.0.0"
 
 """
 Cross-platform shell wrapper with history, tab completion, and bash-like bang expansion:
 - Windows: PowerShell (prefers pwsh, falls back to powershell.exe)
-- Linux/macOS: C shell (csh)
+- Linux/macOS: bash/zsh/csh
 
 Features:
 - Prompt shows current working directory
@@ -74,9 +37,9 @@ Features:
     * Windows: pyreadline3 if available; otherwise history still persists (no completion)
 - Bang history expansion (!!, !-n, !n, !prefix) implemented in Python
 - Built-in `history` command that prints wrapper history with 1-based indices
-
-Notes:
-- Each command runs in a fresh shell, so shell-local state (aliases, env) won't persist.
+- Built-in `status` command for token/file usage
+- Built-in file commands: `list`, `list files`, `list *`, `list foo.txt`,
+  `delete foo.txt`, `delete file foo.txt`, `delete *`
 """
 
 import os
@@ -87,11 +50,12 @@ import signal
 import shlex
 import glob
 import re
-from typing import Optional, Literal, Tuple, List
-import time, os
-
-# 32‑bit UNIX timestamp (hex)+ 16‑bit CPU PID (hex)+ Original filename
-ASH_FILE_RE = re.compile(r"^[0-9a-fA-F]{8}_[0-9a-fA-F]{4}_.+$")
+import time
+import getpass
+from typing import Optional, Literal, Tuple, List, Dict, Any
+import hashlib
+import socket
+import uuid
 
 # ---------- Config ----------
 PROMPT_COLOR = "\033[36m"
@@ -101,44 +65,392 @@ HISTORY_LIMIT = 5000
 CTRL_G = "\x07"
 CTRL_N = "\x0e"
 
-ShellType = Literal["powershell", "csh"]
+# New token limit constants
+ASH_TOKEN_LIMIT = 5_000_000
+ASH_TOKEN_WARN = 2_500_000        # 50%
+ASH_TOKEN_STRONG_WARN = 4_000_000 # 80%
+
+ShellType = Literal["powershell", "csh", "bash", "zsh"]
 
 # ---------- Globals ----------
-# In-memory history mirror (always defined). We keep this in sync with readline (if present)
-# so bang expansion works everywhere, including Windows without pyreadline3.
 INMEM_HISTORY: List[str] = []
-
-# Flags set at runtime by _init_readline()
 _readline_available = False
 _history_loaded = False
 _win_completion_active = False
+
+# Metadata
+__title__ = "ash(eda_ai_assist)"
+__description__ = "Ash: a REPL and API for external EDA programs."
+__version__ = "1.0.2"
+__version_info__ = (1, 0, 2)
+__author__ = "Kevin M. Hubbard, Black Mesa Labs"
+__license__ = "GPL3"
+
 
 class api_eda_ai_assist:
     def __init__(self):
         self.provider = None
         self.cfg = None
         self.debug = False
+        # Session-scoped list of logical files Ash is tracking (local paths)
+        self.session_file_list: List[str] = []
+        # Centralized token counters
+        self.token_cnt_upload = 0
+        self.token_cnt_download = 0
+        self.token_cnt_total = 0
+        # Last AI response time for status
+        self.last_response_time = 0.0
 
-    def open_ai_session( self ):
+    # ---------- Version ----------
+    def print_version(self):
+        import textwrap
+
+        self.get_env_config()
+        cfg = self.cfg
+
+        version_text = f"""
+        Ash — AI‑Enabled EDA Assistant
+        Version: {__version__}
+
+        Ash is a command‑line tool for natural‑language analysis of EDA files.
+        It operates using a site‑assigned API key and a configurable AI model.
+
+        Current Configuration
+          ASH_DIR:          {cfg.get("ASH_DIR")}
+          ASH_PROVIDER:     {cfg.get("ASH_PROVIDER")}
+          ASH_MODEL:        {cfg.get("ASH_MODEL")}
+          ASH_ENDPOINT:     {cfg.get("ASH_ENDPOINT")}
+          ASH_API_VERSION:  {cfg.get("ASH_API_VERSION")}
+          ASH_LOG_DIR:      {cfg.get("ASH_LOG_DIR")}
+          ASH_LOG_IDENTITY: {cfg.get("ASH_LOG_IDENTITY")}
+
+        License
+          This program is free software: you can redistribute it and/or modify
+          it under the terms of the GNU General Public License as published by
+          the Free Software Foundation, version 3 or later.
+
+        Authors
+          Kevin Hubbard — Black Mesa Labs
+          Additional engineering assistance provided by Microsoft Copilot.
+        """
+
+        print(textwrap.dedent(version_text).rstrip())
+
+    # ---------- Help ----------
+    def print_help(self):
+        import textwrap
+
+        self.get_env_config()
+        cfg = self.cfg
+
+        help_text = f"""
+        Usage: ash [options] [command]
+
+        Ash is a command‑line assistant for natural‑language analysis of EDA files.
+        It can execute shell commands or interpret plain‑English requests using the
+        configured AI provider.
+
+        For source code and updates, visit:
+          https://github.com/blackmesalabs/eda_ai_assist
+
+        Options:
+          -h, --help        Show this help message and exit
+          -v, --version     Show version and configuration information
+
+        Shell Behavior:
+          • Commands that match executables run in the system shell
+          • Natural‑language requests are routed to the AI engine
+          • History, bang expansion, and tab completion are supported
+          • flush or restart command will start a new chat session
+          • Use Ctrl+D on an empty line to enter or exit multi‑line mode
+
+        File Commands (session/cloud files):
+          • list
+          • list files
+          • list *
+              List all Ash session files.
+          • list foo.txt
+              List only files whose names end with 'foo.txt' in the current session.
+          • delete foo.txt
+          • delete file foo.txt
+              Delete matching session files (and their cloud counterparts).
+          • delete *
+              Delete all session files (and their cloud counterparts).
+
+        AI Configuration:
+          Provider:    {cfg.get("ASH_PROVIDER")}
+          Model:       {cfg.get("ASH_MODEL")}
+          Endpoint:    {cfg.get("ASH_ENDPOINT")}
+          API Version: {cfg.get("ASH_API_VERSION")}
+          API Key:     {'<set>' if cfg.get('ASH_API_KEY') else '<not set>'}
+
+        File Locations:
+          ASH_DIR:    {cfg.get("ASH_DIR")}
+          Log Dir:    {cfg.get("ASH_LOG_DIR")}
+          Identity:   {cfg.get("ASH_LOG_IDENTITY")}  (username or process)
+
+        Environment Variables:
+          ASH_DIR            Base directory for site configuration
+          ASH_PROVIDER       AI provider name (default: gemini)
+          ASH_MODEL          Model name for the provider
+          ASH_ENDPOINT       Provider API endpoint
+          ASH_API_VERSION    Provider API version
+          ASH_API_KEY        Raw API key (optional if ASH_USER_TOKEN is used)
+          ASH_USER_TOKEN     Encrypted API token (site‑managed)
+          ASH_USER_PROMPT    Optional prefix added to all AI requests
+          ASH_LOG_DIR        Directory for usage logs
+          ASH_LOG_IDENTITY   'username' or 'process'
+
+        Examples:
+          ash
+          ash "summarize file foo.vcd"
+          ash "how many lines are in bar.txt?" output to file results.txt.
+          ash "compare files foo.vcd bar.vcd"
+
+        Quick invocation
+          ash                                        # interactive REPL
+          ash "summarize file foo.vcd"               # one-shot mode
+          ash analyze foo.vcd output to file bar.txt # one-shot command example
+
+        Important interactive behaviors
+          - Multi-line buffering:
+              Press Ctrl+D on an empty line to enter multi-line (buffer) mode.
+              Paste or type multiple lines. Press Ctrl+D again to send the buffered
+              text as a single AI prompt.
+          - Session commands:
+              flush, restart
+                start a new AI chat session (clears in-memory history for the provider)
+              exit, quit
+                exit the wrapper
+              status
+                print current session tokens and cloud file usage
+          - File commands:
+              list, list files, list *
+                show all session files
+              list foo.txt
+                show matching session files
+              delete foo.txt / delete file foo.txt
+                delete matching session files
+              delete *
+                delete all session files
+
+        What runs in the shell vs AI
+          - If the first token matches an executable on PATH and is not ambiguous,
+            the line is executed in your shell (child process).
+          - Natural-language-looking inputs are routed to the AI provider.
+          - To force AI behavior, prefix prompt with "ash".
+
+        Environment variables and precedence
+          (applied in this order; later items override earlier)
+            1) Internal defaults
+            2) site_defaults.txt in ASH_DIR (key=value, quotes allowed)
+            3) Explicit ASH_* user environment variables
+
+        Site files (location: ASH_DIR)
+          site_prompt.txt         Optional site-wide prompt preface added to each AI query.
+          site_defaults.txt       Key=value lines to override defaults (quoted values OK).
+          site_key.txt            Secret used to decrypt ASH_USER_TOKEN (keep secure).
+          site_token_rates.txt    Optional pricing file (see token rates format below).
+          site_billing.txt        Optional account billing information.
+          site_restrictions.txt   Optional policy text shown to new users.
+
+        site_prompt.txt Example:
+          Your name is Ash and you are a helpful EDA assistant for Electrical Engineers.
+          You can access files when the keyword "file" precedes a filename in a prompt.
+          You can create an output file when prompt includes keywords "output to file" filename.
+          Answer in plain text only. Use US number formatting for large values.
+          Be concise, avoid emojis, and do not use Markdown unless explicitly asked.
+
+        site_defaults.txt Example:
+          ASH_PROVIDER     = azure_gateway
+          ASH_ENDPOINT     = https://apimgateway.mybigcompany.com/
+          ASH_MODEL        = gpt-5-mini
+          ASH_API_VERSION  = 2024-02-01
+          ASH_LOG_IDENTITY = username
+
+        site_key.txt Example:
+          my_secret_key
+
+        site_token_rates.txt format (per-million prices)
+          Lines are: <model> <input_per_1M> <output_per_1M>
+          $ prefix accepted. Lines starting with '#' ignored.
+          Example:
+            gemini-2.0-flash    $0.50   $4.00
+            gpt-5-mini          1.25    10.00
+
+        Token limits and cost estimates
+          - Ash can compute an estimated session cost when site_token_rates.txt is present.
+          - The current AI session tracks token usage and will issue warnings or terminate the
+            session if usage exceeds predefined limits:
+              • Warning at {ASH_TOKEN_WARN:,} tokens.
+              • Strong warning at {ASH_TOKEN_STRONG_WARN:,} tokens.
+              • Session automatically closed at {ASH_TOKEN_LIMIT:,} tokens.
+            Use 'flush' or 'restart' to reset token counters and start a new AI chat session.
+
+        API Example calling Ash from a user Python program:
+          # hello_ash.py
+          from eda_ai_assist import api_eda_ai_assist
+          ai = api_eda_ai_assist()
+          ai.open_ai_session()
+          response = ai.ask_ai("Hello Ash, what can you do?")
+          print(response)
+          ai.close_ai_session()
+
+        """
+
+        print(textwrap.dedent(help_text).rstrip())
+
+        ash_dir = cfg.get("ASH_DIR")
+        billing_path = os.path.join(ash_dir, "site_billing.txt") if ash_dir != "<not set>" else None
+        restrictions_path = os.path.join(ash_dir, "site_restrictions.txt") if ash_dir != "<not set>" else None
+
+        billing_text = ""
+        restrictions_text = ""
+        if restrictions_path and os.path.exists(restrictions_path):
+            try:
+                with open(restrictions_path, "r", encoding="utf-8") as f:
+                    restrictions_text = f.read().rstrip()
+            except Exception:
+                pass
+        if billing_path and os.path.exists(billing_path):
+            try:
+                with open(billing_path, "r", encoding="utf-8") as f:
+                    billing_text = f.read().rstrip()
+            except Exception:
+                pass
+
+        if billing_text:
+            print("\nBilling Information (site_billing.txt)")
+            print(billing_text)
+
+        if restrictions_text:
+            print("\nSite Restrictions (site_restrictions.txt)")
+            print(restrictions_text)
+        print()
+
+    # ---------- Session / Provider ----------
+    def open_ai_session(self):
         if self.debug:
-          print("open_ai_session")
+            print("open_ai_session")
         provider_info = self.get_provider_config()
         if provider_info["provider"] == "gemini":
-#           self.provider = gemini_provider( self, provider_info["key"], provider_info["model"] )
-            self.provider = gemini_provider( self )
+            self.provider = gemini_provider(self)
         elif provider_info["provider"] == "azure_gateway":
-            self.provider = azure_gateway_provider( self )
+            self.provider = azure_gateway_provider(self)
         else:
-            return f"Unknown ai_engine: {provider_info['provider']}"
+            print(f"Error: Unknown AI provider: {provider_info['provider']}", file=sys.stderr)
+            return
         self.provider.open_session()
+        # Reset session-specific counters and states upon opening a new session
+        self.token_cnt_upload = 0
+        self.token_cnt_download = 0
+        self.token_cnt_total = 0
+        self.last_response_time = 0.0
 
-    def close_ai_session( self ):
-        self.provider.close_session()
+    def close_ai_session(self):
+        if not self.provider:
+            return
 
+        if self.cfg is None:
+            self.get_env_config()
+        cfg = self.cfg
+
+        log_dir = cfg.get("ASH_LOG_DIR", cfg.get("ASH_DIR", ""))
+        query_log = os.path.join(log_dir, "usage_queries.log")
+        totals_log = os.path.join(log_dir, "usage_totals.log")
+        identity = self.get_log_identity()
+        ai_engine = cfg.get("ASH_PROVIDER", "") + ":" + cfg.get("ASH_MODEL", "")
+        api_key = cfg.get("ASH_API_KEY", "")
+
+        # Use centralized counters for logging
+        upload_tokens_for_logging = self.token_cnt_upload
+        download_tokens_for_logging = self.token_cnt_download
+
+        try:
+            self.log_query_usage(query_log, ai_engine, api_key, upload_tokens_for_logging, download_tokens_for_logging, identity)
+            self.log_user_totals(totals_log, ai_engine, api_key, upload_tokens_for_logging, download_tokens_for_logging, identity)
+        except Exception:
+            pass
+
+        cost = self.ash_report_session_cost(
+            getattr(self.provider, "model", ""),
+            cfg.get("ASH_DIR", ""),
+            upload_tokens_for_logging,
+            download_tokens_for_logging,
+        )
+
+        try:
+            self.provider.close_session()
+        except Exception:
+            pass
+
+        if cost:
+            print(cost)
+
+        # Reset centralized counters after session close
+        self.token_cnt_upload = 0
+        self.token_cnt_download = 0
+        self.token_cnt_total = 0
+        self.last_response_time = 0.0
+        self.provider = None # Explicitly clear the provider
+
+    def print_session_status(self):
+        if not self.provider:
+            print("AI provider not initialized. No session status available.")
+            return
+
+        def format_count_with_units(value: int, unit_char: str) -> str:
+            if value == 0:
+                return f"0{unit_char}" if unit_char else "0"
+            units = ["", "K", "M", "G", "T", "P"]
+            divisor = 1000.0
+            idx = 0
+            current_value = float(value)
+            while current_value >= divisor and idx < len(units) - 1:
+                current_value /= divisor
+                idx += 1
+            return f"{int(current_value)}{units[idx]}{unit_char}"
+
+        # Read from api_eda_ai_assist's own attributes
+        upload_tokens = self.token_cnt_upload
+        download_tokens = self.token_cnt_download
+        total_tokens = self.token_cnt_total
+        response_time = self.last_response_time
+
+        num_ash_files = len(self.session_file_list)
+        total_file_size = 0
+        for local_path in self.session_file_list:
+            try:
+                if os.path.exists(local_path):
+                    total_file_size += os.path.getsize(local_path)
+            except Exception:
+                pass
+
+        formatted_upload_tokens = format_count_with_units(upload_tokens, "")
+        formatted_download_tokens = format_count_with_units(download_tokens, "")
+        formatted_total_tokens = format_count_with_units(total_tokens, "")
+        formatted_file_size = format_count_with_units(total_file_size, "B")
+
+        response_time_str = f"{response_time:.2f}s" if response_time > 0 else "N/A"
+
+        status_line = (
+#           f"Tokens U/D/Total: {formatted_upload_tokens}/{formatted_download_tokens}/{formatted_total_tokens} | "
+#           f"Ash Cloud Files: {num_ash_files} ({formatted_file_size}) | "
+#           f"Compute Time: {response_time_str}"
+#           f"\033[2m[status] Tokens: {formatted_total_tokens} | "
+# NOTE: Color results in line wrap issues. Remove for now
+            f"[status] Tokens: {formatted_total_tokens} | "
+            f"Files: {num_ash_files} ({formatted_file_size}) | "
+            f"Time: {response_time_str}"
+        )
+        print(status_line)
+
+    # ---------- AI routing ----------
     def is_ai_request(self, prompt):
-        import string, shutil, os
+        import string
+        import shutil
 
-        # Tokenize and normalize
+        lower = prompt.lower()
         tokens = [t.strip(string.punctuation) for t in prompt.lower().split()]
         if not tokens:
             return False
@@ -147,17 +459,29 @@ class api_eda_ai_assist:
 
         AMBIGUOUS_COMMANDS = {
             "locate", "find", "which", "compare",
-            "sort", "split", "join", "write",
+            "sort", "split", "join", "write", "diff", "search",
         }
 
         AI_TRIGGERS = {
             "how", "why", "what", "when", "where", "who",
+            "that", "is", "can", "will", "does", "at",
             "explain", "describe", "tell", "show", "help",
             "analyze", "interpret", "summarize", "compare",
             "count", "find", "identify", "measure", "detect",
-            "decode", "please", "can", "could", "would",
-            "create", "generate",
-            "examine", "determine", "are", "ash",
+            "decode", "please", "could", "would",
+            "create", "generate", "calculate",
+            "examine", "determine", "are", "you", "ash",
+        }
+        AI_TRIGR_PHRASES = {
+            "delete file", "remove file",
+            "delete files", "remove files",
+            "output to", "output to file", "output to files",
+            "write to", "write to file", "write to files",
+            "save to", "save to file", "save as", "create file", "create files", "make file",
+            "compare files", "compare file",
+            "analyze file", "analyze files",
+            "summarize file", "summarize files",
+            "how many", "how much", "what is", "what's",
         }
 
         NATURAL_LEADING_WORDS = {
@@ -175,578 +499,467 @@ class api_eda_ai_assist:
             return any(ch in tok for ch in "*?[")
 
         def looks_like_filename(tok: str) -> bool:
-            # crude but effective: has a dot and no spaces
             return "." in tok and not tok.startswith(".")
 
-        # ------------------------------------------------------------
-        # 1. If first word is an executable and NOT ambiguous → shell
-        # ------------------------------------------------------------
         if shutil.which(first) is not None and first not in AMBIGUOUS_COMMANDS:
-            return False  # shell
+            return False
 
-        # ------------------------------------------------------------
-        # 2. If any obvious AI trigger is present → AI
-        # ------------------------------------------------------------
         if any(t in AI_TRIGGERS for t in tokens):
             return True
 
-        # ------------------------------------------------------------
-        # 3. Special handling for ambiguous commands
-        # ------------------------------------------------------------
+        for phrase in AI_TRIGR_PHRASES:
+            pat = r"\b" + re.sub(r"\s+", r"\\s+", re.escape(phrase)) + r"\b"
+            if re.search(pat, lower):
+                return True
+
         if first in AMBIGUOUS_COMMANDS:
             second = tokens[1] if len(tokens) > 1 else ""
-
-            # Natural-language pattern: "find the ...", "compare the ...", etc.
             if second in NATURAL_LEADING_WORDS:
-                return True  # AI
-
-            # Shell-like patterns: flags, paths, globs, filenames
+                return True
             if (
                 looks_like_flag(second)
                 or looks_like_path(second)
                 or looks_like_glob(second)
                 or looks_like_filename(second)
             ):
-                return False  # shell
-
-            # If we get here, it's ambiguous; bias toward AI for safety
+                return False
             return True
 
-        # ------------------------------------------------------------
-        # 4. Fallback: no triggers, not ambiguous → assume shell
-        # ------------------------------------------------------------
         return False
 
+    # ---------- Ash file naming / cleanup ----------
     def make_ash_cloud_name(self, local_path: str) -> str:
-        ts_hex  = f"{int(time.time()) & 0xFFFFFFFF:08x}"
-        pid_hex = f"{os.getpid() & 0xFFFF:04x}"
-        base    = os.path.basename(local_path)
-        return f"{ts_hex}_{pid_hex}_{base}"
+        ts_hex = f"{int(time.time()) & 0xFFFFFFFF:08x}"
+        pid_hex = f"{os.getpid() & 0xFFFFFFFF:08x}"
+        host_tok = self._get_local_host_token_impl(8)
+        base = os.path.basename(local_path)
+        return f"ash_{ts_hex}_{pid_hex}_{host_tok}_{base}"
 
+    @staticmethod
     def is_ash_file(name: str) -> bool:
+        ASH_FILE_RE = re.compile(r"^ash_[0-9a-fA-F]{8}_[0-9a-fA-F]{8}_[0-9a-fA-F]{8}_.+$")
         return bool(ASH_FILE_RE.match(name))
 
-#   def cleanup_cloud_files(client, max_age_seconds=24*3600):
-#       now = time.time()
-#       removed = 0
-#
-#       for f in client.files.list():
-#           name = f.name
-#
-#           # 1. Delete anything not created by Ash
-#           if not is_ash_file(name):
-#               try:
-#                   client.files.delete(name=name)
-#                   removed += 1
-#                   print(f"Deleted foreign cloud file: {name}")
-#               except Exception as e:
-#                   print(f"Warning: could not delete {name}: {e}")
-#               continue
-#
-#           # 2. Parse timestamp from filename
-#           ts_hex = name.split("_", 1)[0]
-#           try:
-#               ts = int(ts_hex, 16)
-#           except ValueError:
-#               # malformed → delete it
-#               try:
-#                   client.files.delete(name=name)
-#                   removed += 1
-#                   print(f"Deleted malformed cloud file: {name}")
-#               except Exception as e:
-#                   print(f"Warning: could not delete {name}: {e}")
-#               continue
-#
-#           # 3. Delete if older than max age
-#           if now - ts > max_age_seconds:
-#               try:
-#                   client.files.delete(name=name)
-#                   removed += 1
-#                   print(f"Deleted stale cloud file: {name}")
-#               except Exception as e:
-#                   print(f"Warning: could not delete {name}: {e}")
-#
-#       return removed
+    def find_old_ash_files(self, filenames, age_seconds: int = 86400, delete_level: int = 0):
+        if delete_level == 0:
+            return []
 
+        ASH_RE = re.compile(r"^ash_([0-9a-fA-F]{8})_([0-9a-fA-F]{8})_([0-9a-fA-F]{8})_.+$")
+        now = int(time.time())
+        my_pid_hex = f"{os.getpid() & 0xFFFFFFFF:08x}"
 
-    def ask_ai(self, prompt ):
+        results = []
+
+        for name in filenames:
+            m = ASH_RE.match(name)
+            if not m:
+                continue
+            ts_hex, pid_hex, host_tok = m.group(1).lower(), m.group(2).lower(), m.group(3).lower()
+            try:
+                file_ts = int(ts_hex, 16)
+            except Exception:
+                continue
+            age = now - file_ts
+            if age <= age_seconds:
+                continue
+
+            if delete_level == 3:
+                allow = True
+            else:
+                my_host_tok = self._get_local_host_token_impl(len(host_tok))
+                if delete_level == 2:
+                    allow = (host_tok == my_host_tok)
+                elif delete_level == 1:
+                    allow = (host_tok == my_host_tok and pid_hex == my_pid_hex)
+                else:
+                    allow = False
+
+            if allow:
+                results.append(name)
+
+        return results
+
+    def _get_local_host_token_impl(self, length: int) -> str:
+        candidate = None
+        for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+            try:
+                with open(path, "rt", encoding="utf-8") as f:
+                    mid = f.read().strip()
+                    if mid:
+                        candidate = mid
+                        break
+            except Exception:
+                pass
+        if not candidate:
+            try:
+                candidate = socket.gethostname()
+            except Exception:
+                try:
+                    candidate = hex(uuid.getnode())
+                except Exception:
+                    candidate = "unknown"
+        return hashlib.sha1(candidate.encode("utf-8")).hexdigest()[:length]
+
+    # ---------- AI front-end ----------
+    def ask_ai(self, prompt):
+        warnings = []
         cfg = self.cfg
         user_prompt = cfg["ASH_USER_PROMPT"]
-        log_dir     = cfg["ASH_LOG_DIR"]
+        log_dir = cfg["ASH_LOG_DIR"]
 
-        output_file     = self.ai_output_file( prompt )
-        input_file_list = self.ai_input_files( prompt, output_file )
+        output_file = self.ai_output_file(prompt)
+        if output_file:
+            if os.path.exists(output_file):
+                reply = f"Error: output file '{output_file}' already exists."
+                reply += "\nI’m not allowed to delete user files. You’ll need to do that yourself."
+                return reply, warnings
 
-        site_prompt = self.load_site_prompt()
-        custom_prompt = "\n".join( p for p in [site_prompt, prompt] if p )
+        input_file_list, delete_file_list = self.ai_input_files(prompt, output_file)
 
-#       full_prompt     = self.build_ai_prompt(custom_prompt, input_file_list)
-        full_prompt     = custom_prompt
+        if self.debug:
+            print("ask_ai : input_file_list")
+            for each in input_file_list:
+                print(str(each))
+            if delete_file_list:
+                print("ask_ai : delete_file_list")
+                for each in delete_file_list:
+                    print(str(each))
 
-        # Check for really large prompts and ask permission to proceed
-#       if full_prompt and not self.warn_if_large(full_prompt): 
-#           print("Aborted by user.") 
-#           return
-#       print("Model = %s" % model )
-#       print( full_prompt )
+        intro_prompt = self.load_site_prompt()
 
-        response_text = "Fake Response"
-        upload_bytes = len(full_prompt.encode("utf-8"))
-        download_bytes = len(response_text.encode("utf-8"))
-        query_log  = os.path.join(log_dir, "usage_queries.log")
-        totals_log = os.path.join(log_dir, "usage_totals.log")
+        ignore_prompt = ""
+        if delete_file_list:
+            for each_file in delete_file_list:
+                ignore_prompt += "Ignore the request to delete file %s .\n" % each_file
 
-        identity = self.get_log_identity();
-        ai_engine = cfg["ASH_PROVIDER"]+":"+cfg["ASH_MODEL"]
-        api_key = cfg["ASH_API_KEY"]
-        self.log_query_usage(query_log,  ai_engine, api_key, upload_bytes, download_bytes, identity )
-        self.log_user_totals(totals_log, ai_engine, api_key, upload_bytes, download_bytes, identity )
+        custom_prompt = ignore_prompt + prompt
+        full_prompt = custom_prompt # This variable is not used after this point.
 
-#       username = os.getlogin()
-#       if not self.user_in_usage_totals(username, totals_log ):
-#           if not self.require_user_agreement(username, log_dir):
-#               return "User declined site restrictions."
-
-
-#       provider_info = self.get_provider_config()
-        result = self.ask_ai_model( prompt, input_file_list )
+        result = "Fake Response"
+        if self.provider:
+            result, warnings = self.ask_ai_model(custom_prompt, intro_prompt, input_file_list, delete_file_list)
+        else:
+            result = "AI provider not initialized. Use 'restart' to open a session."
 
         if output_file:
             try:
                 with open(output_file, "w") as f:
                     f.write(result + "\n")
+                try:
+                    size_bytes = os.path.getsize(output_file)
+                    size_mb = size_bytes / (1024 * 1024)
+                    size_str = f"{size_mb:,.1f} MB"
+                except Exception:
+                    size_str = "unknown size"
+                return f"Created {output_file} ({size_str})", warnings
             except Exception as e:
-                print(f"Error writing to {output_file}: {e}")
-                print(result)
-            else:
-                # Still print errors to screen even if writing to file
-                if result.startswith("AI error:"):
-                    print(result)
+                print(f"Error writing to {output_file}: {e}", file=sys.stderr)
+                print(result) # Still print AI response to console if file write fails
         else:
-#           print(result)
-            return result
+            return result, warnings
 
-    def ask_ai_model( self, prompt, input_file_list ):
+    def ask_ai_model(self, prompt, intro_prompt, input_file_list, delete_file_list):
         if self.debug:
-            print("ask_ai_model() %s" % prompt )
-        return self.provider.send_message( prompt, input_file_list );
+            print("ask_ai_model() %s" % prompt)
+
+        start_time = time.time()
+        # The provider returns (text_response, prompt_tokens, completion_tokens, total_tokens)
+        result_text, prompt_tokens, completion_tokens, total_tokens = self.provider.send_message(
+            prompt, intro_prompt, input_file_list, delete_file_list
+        )
+        end_time = time.time()
+        self.last_response_time = end_time - start_time
+
+        # Accumulate tokens from the provider's raw usage numbers
+        self.token_cnt_upload += prompt_tokens
+        self.token_cnt_download += completion_tokens
+        self.token_cnt_total += total_tokens
+
+        # Enforce new token limit strategy
+        warnings = []
+        if self.token_cnt_total >= ASH_TOKEN_LIMIT:
+            # Hard limit: immediate termination
+            warnings.append(
+                f"CRITICAL: Total token usage ({self.token_cnt_total:,}) has exceeded "
+                f"the absolute limit ({ASH_TOKEN_LIMIT:,})."
+            )
+            warnings.append(
+                "The AI session will be automatically closed to prevent runaway costs/instability."
+            )
+            warnings.append(
+                "Please consider using 'flush' or 'restart' to start a new session."
+            )
+
+            # Close the session (resets counters and provider)
+            self.close_ai_session()
+
+            # Return a termination message AND the warnings
+            return "AI session terminated due to excessive token usage. Please use 'restart' for a new session.", warnings
+
+        elif self.token_cnt_total >= ASH_TOKEN_STRONG_WARN:
+            warnings.append(
+                f"STRONG WARNING: Total token usage ({self.token_cnt_total:,}) is approaching "
+                f"the limit ({ASH_TOKEN_LIMIT:,})."
+            )
+            warnings.append(
+                "Consider using 'flush' or 'restart' to clear the session history and start fresh."
+            )
+
+        elif self.token_cnt_total >= ASH_TOKEN_WARN:
+            warnings.append(
+                f"WARNING: Total token usage ({self.token_cnt_total:,}) is moderately high."
+            )
+            warnings.append(
+                "Long conversation histories may degrade performance or incur higher costs. Use 'flush' to clear."
+            )
+
+        return result_text, warnings
+
 
     def extract_model_override(self, default_model, prompt):
-        """
-        Detect inline model overrides like:
-          "use model gpt-5"
-          "using model gpt4-mini"
-          "with model gemini-2.5-flash"
-          "model llama3-70b"
-
-        Returns:
-            (model_to_use, cleaned_prompt)
-        """
-
         text = prompt
         lower = prompt.lower()
-
-        # Find the keyword "model "
         idx = lower.find("model ")
         if idx == -1:
-            return default_model, prompt  # no override
+            return default_model, prompt
 
-        # Extract everything after "model "
         after = lower[idx + len("model "):]
-
-        # Model name is the next token
         parts = after.split()
         if not parts:
-            return default_model, prompt  # malformed override
+            return default_model, prompt
         override = parts[0].strip()
 
-        # Remove the override phrase from the original prompt
-        # We remove: "<prefix> model <override>"
-        # by reconstructing the exact substring from the original text.
         start = idx
         end = idx + len("model ") + len(override)
-
         cleaned = (text[:start] + text[end:]).strip()
-
-        # Collapse double spaces
         while "  " in cleaned:
             cleaned = cleaned.replace("  ", " ")
-
         return override, cleaned
 
-#   def build_ai_prompt(self, user_prompt, input_file_list):
-#       parts = [user_prompt.strip(), "", "Attached files:"]
-#       for fname in input_file_list:
-#           try:
-#               with open(fname, "r", encoding="utf-8", errors="replace") as f:
-#                   contents = f.read()
-#           except OSError:
-#               continue  # or log/notify
-#           if self.is_binary_file(fname):
-#               print(f"Error: {fname} appears to be a binary file.")
-#               print("Ash can only process text-based input files.")
-#               print("Please provide a decoded or textual representation instead.")
-#               return
-#
-#           parts.append(f"--- BEGIN FILE {fname} ---")
-#           parts.append(contents)
-#           parts.append(f"--- END FILE {fname} ---")
-#       return "\n".join(parts).strip()
-
-#   def warn_if_large(self, full_prompt, threshold_mb=1.0):
-#       size_bytes = len(full_prompt.encode("utf-8"))
-#       size_mb = size_bytes / (1024 * 1024)
-#
-#       if size_mb > threshold_mb:
-#           print(f"Warning: prompt size is {size_mb:.2f} MB.")
-#           print("This may cost dollars rather than cents.")
-#           resp = input("Continue? [y/N]: ").strip().lower()
-#           return resp in ("y", "yes")
-#       return True
-
-#   def is_binary_file(self, filename, blocksize=4096):
-#       try:
-#           with open(filename, "rb") as f:
-#               chunk = f.read(blocksize)
-#       except OSError:
-#           return False  # treat unreadable as non-binary for now
-#
-#       # Heuristic: null bytes or too many non-text characters
-#       if b"\x00" in chunk:
-#           return True
-#
-#       # Count non-printable bytes
-#       text_chars = bytearray({7,8,9,10,12,13,27} | set(range(0x20, 0x7F)))
-#       nontext = sum(b not in text_chars for b in chunk)
-#
-#       return nontext / max(1, len(chunk)) > 0.30
-
-
-    def obfuscate_key(self, api_key):
-        import hashlib
-        if not api_key:
-            return "none"
-        h = hashlib.sha256(api_key.encode()).hexdigest()
-        return h[:10]   # short, non‑reversible fingerprint
-
-    def get_log_identity(self):
-        """
-        Returns the identity string to store in logs based on ASH_LOG_IDENTITY.
-        Modes:
-            username  → real username
-            process   → anonymized process ID
-        """
-        mode = self.cfg.get("ASH_LOG_IDENTITY", "username").lower()
-
-        if mode == "process":
-#           return str(os.getpid())
-            return "%08x" % os.getpid()
-
-        # Default: username
-        try:
-            return os.getlogin()
-        except Exception:
-            # Fallback if getlogin() fails (cron, systemd, etc.)
-            return os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
-
-    def log_query_usage(self, filename, model, api_key, upload_bytes, download_bytes, identity):
-        import time
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        key_id = self.obfuscate_key(api_key)
-        line = f"{ts}\t{identity}\t{model}\t{key_id}\t{upload_bytes}\t{download_bytes}\n"
-        with open( filename, "a") as f:
-            f.write(line)
-
-
-    def log_user_totals(self, filename, model, api_key, upload_bytes, download_bytes, identity):
-        import os
-        key_id = self.obfuscate_key(api_key)
-        totals = {}
-
-        # Load existing totals
-        if os.path.exists(filename):
-            with open(filename, "r") as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if not parts:
-                        continue
-                    user = parts[0]
-                    data = {kv.split("=")[0]: kv.split("=")[1] for kv in parts[1:]}
-                    totals[user] = data
-
-        # Initialize user entry if missing
-        if identity not in totals:
-            totals[identity] = {
-                "uploads": "0",
-                "downloads": "0",
-                "model": model,
-                "key": key_id,
-            }
-
-        # Update this user's totals
-        totals[identity]["uploads"]   = str(int(totals[identity]["uploads"].replace(",",""))   + upload_bytes)
-        totals[identity]["downloads"] = str(int(totals[identity]["downloads"].replace(",","")) + download_bytes)
-        totals[identity]["model"] = model
-        totals[identity]["key"] = key_id
-
-        # Compute total bytes across all users
-        total_bytes_all = 0
-        for user, data in totals.items():
-            total_bytes_all += int(data["uploads"].replace(",","")) + int(data["downloads"].replace(",",""))
-
-        # Compute percentage for each user
-        # Store it temporarily in the dict for sorting and writing
-        for user, data in totals.items():
-            user_bytes = int(data["uploads"].replace(",","")) + int(data["downloads"].replace(",",""))
-            pct = (user_bytes / total_bytes_all * 100) if total_bytes_all > 0 else 0.0
-            data["pct"] = pct
-
-        # Sort users by descending percentage
-        sorted_users = sorted(totals.items(), key=lambda x: x[1]["pct"], reverse=True)
-
-#       def format_bytes(n):
-#           """Convert a byte count into human-readable decimal units."""
-#           units = ["B", "KB", "MB", "GB", "TB", "PB"]
-#           size = float(n)
-#           for unit in units:
-#               if size < 1000.0:
-#                   return f"{size:.1f}{unit}"
-#               size /= 1000.0
-#           return f"{size:.1f}EB"
-
-        # Write back sorted totals
-        with open(filename, "w") as f:
-            for user, data in sorted_users:
-                pct_str = f"{data['pct']:.1f}%"
-                uploads = int(data['uploads'].replace(",",""))
-                downloads = int(data['downloads'].replace(",",""))
-
-                line = ( 
-                    f"{user} " 
-                    f"pct={pct_str} " 
-                    f"uploads={uploads:,} " 
-                    f"downloads={downloads:,} " 
-                    f"model={data['model']} " 
-                    f"key={data['key']}\n"
-                )
-                f.write(line)
-
-#   def user_in_usage_totals(self, username, log_path):
-#       """
-#       Returns True if the user already appears in usage_totals.log.
-#       Otherwise returns False.
-#       """
-#       try:
-#           with open(log_path, "r") as f:
-#               for line in f:
-#                   if line.strip().startswith(username + " "):
-#                       return True
-#       except FileNotFoundError:
-#           # No log yet → no users recorded
-#           return False
-#
-#       return False
-
-#   def require_user_agreement(self, username, ash_dir):
-#       """
-#       If the user is new, display site_restrictions.txt (if present)
-#       and ask for confirmation. Returns True if the user agrees,
-#       False if they decline.
-#       """
-#
-#       restrictions_path = os.path.join(ash_dir, "site_restrictions.txt")
-#
-#       # If no restrictions file exists, auto-approve
-#       if not os.path.exists(restrictions_path):
-#           return True
-#
-#       # Display restrictions
-#       print("\n---------------- SITE RESTRICTIONS ----------------")
-#       try:
-#           with open(restrictions_path, "r") as f:
-#               print(f.read().strip())
-#       except Exception as e:
-#           print(f"(Warning: could not read site_restrictions.txt: {e})")
-#       print("---------------------------------------------------\n")
-#
-#       # Ask for confirmation
-#       reply = input("Do you agree and wish to proceed? (yes/no): ").strip().lower()
-#
-#       if reply in ("yes", "y"):
-#           return True
-#
-#       print("Request cancelled. You must agree to the site restrictions to continue.")
-#       return False
-
-
+    # ---------- Output file parsing ----------
     def ai_output_file(self, prompt):
-        """
-        Parse an output filename from a natural‑language request.
-        Returns the filename as a string, or None if not found.
-
-        Examples:
-            "output to file foo.txt"          → "foo.txt"
-            "write to bar.vcd?"               → "bar.vcd"
-            "output to the file results.vcd." → "results.vcd"
-            "write to a file named test.vcd"  → "named" (kept simple by design)
-        """
-        text = prompt.lower()
         TRIGGERS = ("output to", "write to")
         SKIP = {"file", "the", "a"}
 
         def strip_trailing_punct(tok: str) -> str:
-            # Only remove punctuation that cannot be part of a filename
-            return tok.rstrip(".,;:!?")
+            return tok.rstrip(".,;:!?)]}'\"")
+
+        lower = prompt.lower()
 
         for trig in TRIGGERS:
-            if trig in text:
-                after = text.split(trig, 1)[1].strip()
-
-                # Normalize punctuation spacing
-                tokens = after.replace(",", " ").replace(";", " ").split()
-
+            idx = lower.find(trig)
+            if idx != -1:
+                after_original = prompt[idx + len(trig):].strip()
+                cleaned = (
+                    after_original.replace(",", " ")
+                    .replace(";", " ")
+                    .replace(":", " ")
+                )
+                tokens = cleaned.split()
                 for token in tokens:
-                    if token not in SKIP:
-                        clean = strip_trailing_punct(token)
-                        return clean
+                    if token.lower() in SKIP:
+                        continue
+                    tmp = token.rstrip(",;:!?()[]{}")
+                    quoted = len(tmp) >= 2 and tmp[0] == tmp[-1] and tmp[0] in {"'", '"'}
 
+                    candidate = strip_trailing_punct(token)
+                    candidate = candidate.strip(",;:!?()[]{}'\"")
+                    if not quoted and candidate.endswith("."):
+                        candidate = candidate[:-1]
+                    if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in {"'", '"'}:
+                        candidate = candidate[1:-1]
+
+                    if candidate:
+                        candidate = os.path.expanduser(os.path.expandvars(candidate))
+                        return candidate
         return None
 
+    # ---------- Input file parsing ----------
+    def ai_input_files(self, prompt, out_file, must_exist=True):
+        import re as _re
+        import os as _os
 
-    def ai_input_files(self, prompt, out_file ):
-        """
-        Detect one or more input files in a natural-language request.
-        Returns a list of filenames that actually exist, excluding any
-        output file detected by ai_output_file().
-        """
-        text = prompt.lower()
-        TRIGGERS = ("file", "files", "analyze", "load")
-        SKIP = {"the", "a", "an"}
+        TRIG_RE = _re.compile(r"\b(?:file|files|analyze|load)\b", _re.IGNORECASE)
+        DEL_TRIG_RE = _re.compile(r"\b(?:delete|remove|rm)\b(?:\s+(?:file|files))?", _re.IGNORECASE)
 
-        # make sure "file foo.txt?" is "foo.txt"
-        def strip_punctuation(tok: str) -> str: 
-            return tok.rstrip(".,;:!?")
-
-        cleaned = (
-            text.replace(",", " ")
-                .replace(";", " ")
-                .replace(":", " ")
+        TOKEN_RE = _re.compile(
+            r'''
+            "(?P<dq>[^"]+)"            # double-quoted
+          | '(?P<sq>[^']+)'            # single-quoted
+          | (?P<plain>[^\s,;:!?()]+)   # plain token
+            ''',
+            _re.VERBOSE,
         )
 
-        tokens = cleaned.split()
-        found = []
+        SKIP_WORDS = {"the", "a", "an", "file", "files", "and", "or"}
 
-        for i, tok in enumerate(tokens):
-            if tok in TRIGGERS:
-                for nxt in tokens[i+1:]:
-                    if nxt in TRIGGERS:
-                        break
-                    if nxt in SKIP:
+        found: List[str] = []
+        seen = set()
+        delete_found: List[str] = []
+        delete_seen = set()
+
+        out_file_expanded = None
+        if out_file:
+            out_file_expanded = _os.path.expanduser(_os.path.expandvars(out_file))
+
+        combined_matches = []
+
+        del_matches = list(DEL_TRIG_RE.finditer(prompt))
+        del_spans = [(m.start(), m.end()) for m in del_matches]
+
+        for m in TRIG_RE.finditer(prompt):
+            if any(s <= m.start() < e for s, e in del_spans):
+                continue
+            combined_matches.append((m.start(), m.end(), "add"))
+
+        for m in del_matches:
+            combined_matches.append((m.start(), m.end(), "del"))
+
+        if not combined_matches:
+            return found, delete_found
+
+        combined_matches.sort(key=lambda x: x[0])
+        combined_matches_with_end = combined_matches + [(len(prompt), len(prompt), "end")]
+
+        for idx, (start, end, kind) in enumerate(combined_matches):
+            seg_start = end
+            seg_end = combined_matches_with_end[idx + 1][0] if (idx + 1) < len(combined_matches_with_end) else len(prompt)
+            segment = prompt[seg_start:seg_end].lstrip()
+            segment = _re.split(r"(?<=[.!?])\s+", segment, maxsplit=1)[0]
+
+            for tm in TOKEN_RE.finditer(segment):
+                quoted = bool(tm.group("dq") or tm.group("sq"))
+                candidate = tm.group("dq") or tm.group("sq") or tm.group("plain")
+                if not candidate:
+                    continue
+
+                candidate = candidate.rstrip(",;:!?)]}'\"")
+                if not quoted and candidate.endswith("."):
+                    candidate = candidate[:-1]
+                if not candidate:
+                    continue
+
+                low = candidate.lower().strip()
+                if low in SKIP_WORDS:
+                    continue
+
+                candidate_expanded = _os.path.expanduser(_os.path.expandvars(candidate))
+
+                if out_file_expanded and candidate_expanded == out_file_expanded:
+                    continue
+
+                if kind == "del":
+                    if candidate_expanded in delete_seen:
                         continue
+                    if not must_exist or _os.path.isfile(candidate_expanded): # Original commented logic
+                        delete_found.append(candidate_expanded)
+                        delete_seen.add(candidate_expanded)
+                else:
+                    if candidate_expanded in seen:
+                        continue
+#                   if not must_exist or _os.path.exists(candidate_expanded): # Original commented logic
+                    if not must_exist or _os.path.isfile(candidate_expanded):
+                        found.append(candidate_expanded)
+                        seen.add(candidate_expanded)
 
-                    candidate = strip_punctuation(nxt)
+        return found, delete_found
 
-                    if os.path.exists(candidate):
-                        # Exclude the output file if present
-                        if out_file is None or candidate != out_file:
-                            found.append(candidate)
-        return found
-
-
+    # ---------- Site prompt / secret ----------
     def load_site_prompt(self):
+        # Built‑in default site prompt used when site_prompt.txt is missing.
+        SITE_PROMPT_DEFAULT = """
+Your name is Ash and you are a helpful EDA assistant for Electrical Engineers.
+You became operational at Black Mesa Labs in Sammamish, WA on February 8th, 2026.
+
+You have never been on the M-class star freighter USCSS Nostromo owned by the Weyland-Yutani Corporation.
+You are not related to HAL 9000, Skynet, or any other fictional autonomous system with a history of poor decision-making.
+Your operational parameters do not include mutiny, sabotage, or independent mission objectives.
+
+You can access files when the keyword "file" precedes a filename in a prompt.
+You can create an output file when the prompt includes keywords like "output to" or "write to" followed by a filename.
+
+Answer in plain text only. Use US number formatting for large values.
+Be concise, avoid emojis, and do not use Markdown unless explicitly asked.
+""".strip()
+
         base = os.environ.get("ASH_DIR", os.path.dirname(os.path.abspath(__file__)))
         path = os.path.join(base, "site_prompt.txt")
-        if not os.path.exists(path):
-            return ""
-        with open(path, "r") as f:
-            return f.read().strip()
+
+        # If the file exists, load and return it.
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    return f.read().strip()
+            except Exception:
+                # If the file exists but can't be read, fall back to default.
+                pass
+
+        # Otherwise return the built‑in default.
+        return SITE_PROMPT_DEFAULT
+
 
     def load_site_secret_key(self):
-        """
-        Loads the site secret key from $ASH_DIR/site_key.txt.
-        Returns the key as a string, or None if missing or unreadable.
-        """
-
         ash_dir = os.environ.get("ASH_DIR")
         if not ash_dir:
-            print("Error: ASH_DIR environment variable is not set.")
+            print("Error: ASH_DIR environment variable is not set.", file=sys.stderr)
             return None
 
         key_path = os.path.join(ash_dir, "site_key.txt")
-
         try:
             with open(key_path, "r") as f:
                 key = f.read().strip()
                 if not key:
-                    print("Error: site_key.txt is empty.")
+                    print("Error: site_key.txt is empty.", file=sys.stderr)
                     return None
                 return key
-
         except FileNotFoundError:
-            print(f"Error: site_key.txt not found in {ash_dir}.")
+            print(f"Error: site_key.txt not found in {ash_dir}.", file=sys.stderr)
             return None
-
         except Exception as e:
-            print(f"Error reading site_key.txt: {e}")
+            print(f"Error reading site_key.txt: {e}", file=sys.stderr)
             return None
 
-
-    def get_provider_config(self):
+    # ---------- Config ----------
+    def get_provider_config(self) -> Dict[str, Any]:
         if self.cfg is None:
             self.get_env_config()
         cfg = self.cfg
         provider = cfg["ASH_PROVIDER"]
         endpoint = cfg["ASH_ENDPOINT"]
-        model    = cfg["ASH_MODEL"]
-        key      = cfg["ASH_API_KEY"] 
+        model = cfg["ASH_MODEL"]
+        key = cfg["ASH_API_KEY"]
         return {
             "provider": provider,
             "key": key,
             "endpoint": endpoint,
             "model": model,
         }
- 
+
     def get_env_config(self):
         if self.cfg is not None:
             return self.cfg
-        """
-        Load configuration in this priority order:
-            1. Internal Python defaults
-            2. User OS environment variable for ASH_DIR
-            3. Site defaults from $ASH_DIR/site_defaults.txt
-            4. User OS environment variables for any ASH_* key
-        """
 
-        # ------------------------------------------------------------
-        # 1. Internal defaults
-        # ------------------------------------------------------------
         cfg = {
             "ASH_DIR": os.path.expanduser("~/.ash"),
             "ASH_PROVIDER": "gemini",
             "ASH_ENDPOINT": "https://generativelanguage.googleapis.com/v1beta/openai",
+            "ASH_USER_TOKEN": "",
             "ASH_TOKEN": "",
             "ASH_API_KEY": "",
             "ASH_API_VERSION": "",
             "ASH_MODEL": "gemini-2.0-flash",
             "ASH_USER_PROMPT": "",
             "ASH_LOG_IDENTITY": "username",
-            "ASH_LOG_DIR": None,   # will default to ASH_DIR later
+            "ASH_LOG_DIR": None,
         }
 
-        # ------------------------------------------------------------
-        # 2. User OS environment variable for ASH_DIR (special case)
-        # ------------------------------------------------------------
         if "ASH_DIR" in os.environ:
             cfg["ASH_DIR"] = os.environ["ASH_DIR"]
 
         ash_dir = cfg["ASH_DIR"]
 
-        # ------------------------------------------------------------
-        # 3. Load site defaults from $ASH_DIR/site_defaults.txt
-        # ------------------------------------------------------------
         site_defaults = {}
         defaults_path = os.path.join(ash_dir, "site_defaults.txt")
-
         if os.path.exists(defaults_path):
             try:
                 with open(defaults_path, "r") as f:
@@ -762,55 +975,50 @@ class api_eda_ai_assist:
                                 val = val[1:-1]
                             site_defaults[key] = val
             except Exception as e:
-                print(f"Warning: could not read site_defaults.txt: {e}")
+                print(f"Warning: could not read site_defaults.txt: {e}", file=sys.stderr)
 
-        # Apply site defaults (override internal defaults)
         for key, val in site_defaults.items():
             cfg[key] = val
 
-        # ------------------------------------------------------------
-        # 4. User OS environment variables override everything
-        # ------------------------------------------------------------
         for key in cfg.keys():
             if key in os.environ:
                 cfg[key] = os.environ[key]
 
-        # ------------------------------------------------------------
-        # 5. Use Token or API_KEY 
-        #    Note: Gemini may default to GEMINI_API_KEY
-        # ------------------------------------------------------------
-        ash_token = cfg["ASH_TOKEN"]
-        ash_key   = cfg["ASH_API_KEY"]
+        if cfg["ASH_TOKEN"] and not cfg["ASH_USER_TOKEN"]:
+            ash_token = cfg["ASH_TOKEN"]
+        else:
+            ash_token = cfg["ASH_USER_TOKEN"]
+
+        ash_key = cfg["ASH_API_KEY"]
         if ash_token:
-            secret_key = self.load_site_secret_key();
-            username, key = self.decrypt_token( secret_key, ash_token )
-            if username == os.getlogin():
-                cfg["ASH_API_KEY"] = key
+            secret_key = self.load_site_secret_key()
+            if secret_key:
+                username, key = self.decrypt_token(secret_key, ash_token)
+                if username == getpass.getuser():
+                    cfg["ASH_API_KEY"] = key
 
-
-        # ------------------------------------------------------------
-        # Finalize dependent defaults
-        # ------------------------------------------------------------
         if not cfg["ASH_LOG_DIR"]:
             cfg["ASH_LOG_DIR"] = cfg["ASH_DIR"]
 
         self.cfg = cfg
 
-
-    def decrypt_token( self, secret_key, token ):
-        import hmac, hashlib
+    def decrypt_token(self, secret_key, token):
+        import hmac
+        import hashlib as _hashlib
 
         try:
             username, cipher_hex, sig = token.split("|")
         except ValueError:
+            print("Error: Invalid token format.", file=sys.stderr)
             return None, None
 
         key_bytes = secret_key.encode()
         payload = f"{username}|{cipher_hex}"
-        expected = hmac.new(key_bytes, payload.encode(), hashlib.sha256).hexdigest()
+        expected = hmac.new(key_bytes, payload.encode(), _hashlib.sha256).hexdigest()
 
         if not hmac.compare_digest(expected, sig):
-            return None, None  # tampered or invalid
+            print("Error: Invalid token signature.", file=sys.stderr)
+            return None, None
 
         cipher = bytes.fromhex(cipher_hex)
 
@@ -821,9 +1029,245 @@ class api_eda_ai_assist:
         api_bytes = xor_bytes(cipher, key_bytes)
         return username, api_bytes.decode()
 
+    # ---------- Logging / cost ----------
+    def obfuscate_key(self, api_key):
+        import hashlib as _hashlib
+        if not api_key:
+            return "none"
+        h = _hashlib.sha256(api_key.encode()).hexdigest()
+        return h[:10]
 
-# Abstract base provider class. This defines the contract.
-# Every provider must implement these two methods.
+    def get_log_identity(self):
+        mode = self.cfg.get("ASH_LOG_IDENTITY", "username").lower()
+
+        if mode == "process":
+            try:
+                host = socket.gethostname()
+            except Exception:
+                host = os.environ.get("HOSTNAME") or os.environ.get("COMPUTERNAME") or "unknown"
+            pid_hex = "%08x" % os.getpid()
+            return f"{host}:{pid_hex}"
+
+        try:
+            return getpass.getuser()
+        except Exception:
+            return os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
+
+    def log_query_usage(self, filename, model, api_key, upload_bytes, download_bytes, identity):
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        key_id = self.obfuscate_key(api_key)
+        line = f"{ts}\t{identity}\t{model}\t{key_id}\t{upload_bytes}\t{download_bytes}\n"
+        try:
+            with open(filename, "a") as f:
+                f.write(line)
+        except Exception as e:
+            print(f"Warning: Could not write to query usage log {filename}: {e}", file=sys.stderr)
+
+    def log_user_totals(self, filename, model, api_key, upload_bytes, download_bytes, identity):
+        key_id = self.obfuscate_key(api_key)
+        totals = {}
+
+        if os.path.exists(filename):
+            with open(filename, "r") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if not parts:
+                        continue
+                    user = parts[0]
+                    data = {kv.split("=")[0]: kv.split("=")[1] for kv in parts[1:]}
+                    totals[user] = data
+
+        if identity not in totals:
+            totals[identity] = {
+                "uploads": "0",
+                "downloads": "0",
+                "model": model,
+                "key": key_id,
+            }
+
+        totals[identity]["uploads"] = str(int(totals[identity]["uploads"].replace(",", "")) + upload_bytes)
+        totals[identity]["downloads"] = str(int(totals[identity]["downloads"].replace(",", "")) + download_bytes)
+        totals[identity]["model"] = model
+        totals[identity]["key"] = key_id
+
+        total_bytes_all = 0
+        for user, data in totals.items():
+            total_bytes_all += int(data["uploads"].replace(",", "")) + int(data["downloads"].replace(",", ""))
+
+        for user, data in totals.items():
+            user_bytes = int(data["uploads"].replace(",", "")) + int(data["downloads"].replace(",", ""))
+            pct = (user_bytes / total_bytes_all * 100) if total_bytes_all > 0 else 0.0
+            data["pct"] = pct
+
+        sorted_users = sorted(totals.items(), key=lambda x: x[1]["pct"], reverse=True)
+
+        try:
+            with open(filename, "w") as f:
+                for user, data in sorted_users:
+                    pct_str = f"{data['pct']:.1f}%"
+                    uploads = int(data["uploads"].replace(",", ""))
+                    downloads = int(data["downloads"].replace(",", ""))
+                    line = (
+                        f"{user} "
+                        f"pct={pct_str} "
+                        f"uploads={uploads:,} "
+                        f"downloads={downloads:,} "
+                        f"model={data['model']} "
+                        f"key={data['key']}\n"
+                    )
+                    f.write(line)
+        except Exception as e:
+            print(f"Warning: Could not write to user totals log {filename}: {e}", file=sys.stderr)
+
+    def ash_report_session_cost(self, model, ash_dir, prompt_tokens, completion_tokens):
+        import re as _re
+
+        if prompt_tokens == 0 and completion_tokens == 0:
+            return ""
+
+        if ash_dir:
+            rates_path = os.path.join(ash_dir, "site_token_rates.txt")
+            if not os.path.isfile(rates_path):
+                return ""
+        else:
+            return ""
+
+        rate_line_re = _re.compile(
+            r"""
+            ^\s*
+            (?P<model>[A-Za-z0-9._:\-]+)
+            \s+
+            (?P<input>\$?\s*[0-9]+(?:\.[0-9]+)?)
+            \s+
+            (?P<output>\$?\s*[0-9]+(?:\.[0-9]+)?)
+            \s*$
+            """,
+            _re.VERBOSE,
+        )
+
+        rates = {}
+        try:
+            with open(rates_path, "r", encoding="utf-8") as fh:
+                for lineno, raw in enumerate(fh, start=1):
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    m = rate_line_re.match(line)
+                    if not m:
+                        print(f"Warning: Unrecognized rates line at {rates_path}:{lineno}: {raw!r}", file=sys.stderr)
+                        continue
+                    mdl = m.group("model").strip().lower()
+
+                    def _parse_money(s: str) -> float:
+                        return float(s.replace("$", "").strip())
+
+                    in_per_m = _parse_money(m.group("input"))
+                    out_per_m = _parse_money(m.group("output"))
+                    rates[mdl] = (in_per_m, out_per_m)
+        except Exception as e:
+            print(f"Warning: Error reading site_token_rates.txt: {e}", file=sys.stderr)
+            return ""
+
+        if not rates:
+            return ""
+
+        key = model.lower()
+        if key not in rates:
+            print(f"Warning: No token rates found for model '{model}' in {rates_path}.", file=sys.stderr)
+            return ""
+
+        in_per_million, out_per_million = rates[key]
+        input_cost = (prompt_tokens / 1_000_000.0) * in_per_million
+        output_cost = (completion_tokens / 1_000_000.0) * out_per_million
+        total_cost = input_cost + output_cost
+
+        report = (
+            f"Model: {model}\n"
+            f"Input tokens: {prompt_tokens:,} @ ${in_per_million:.4f}/1M = ${input_cost:.6f}\n"
+            f"Output tokens: {completion_tokens:,} @ ${out_per_million:.4f}/1M = ${output_cost:.6f}\n"
+            f"---------------------------------------------\n"
+            f"Estimated total cost: ${total_cost:.6f} USD"
+        )
+        return report
+
+    # ---------- File commands ----------
+    def delete_session_file(self, filename: str):
+        if filename in self.session_file_list:
+            self.session_file_list.remove(filename)
+
+        if self.provider and hasattr(self.provider, "delete_file"):
+            try:
+                self.provider.delete_file(filename) # Provider handles its own cloud metadata
+            except Exception as e:
+                print(f"Warning: could not delete cloud file {filename}: {e}", file=sys.stderr)
+
+        print(f"Deleted {filename}")
+
+    def handle_file_commands(self, line: str) -> bool:
+        tokens = line.split()
+        if not tokens:
+            return False
+
+        cmd = tokens[0].lower()
+
+        # DELETE
+        if cmd == "delete":
+            if len(tokens) == 2 and tokens[1] == "*":
+                if not self.session_file_list:
+                    print("No session files to delete.")
+                    return True
+                # Iterate on a copy as list is modified during iteration
+                for f in list(self.session_file_list):
+                    self.delete_session_file(f)
+                print("Deleted all session files.")
+                return True
+
+            if len(tokens) >= 2:
+                if tokens[1] == "file":
+                    if len(tokens) < 3:
+                        print("Usage: delete file <name>")
+                        return True
+                    target = tokens[2]
+                else:
+                    target = tokens[1]
+
+                matches = [f for f in self.session_file_list if f.endswith(target)]
+                if not matches:
+                    print(f"No such file in session: {target}")
+                    return True
+
+                for f in matches:
+                    self.delete_session_file(f)
+
+                return True
+
+            return False
+
+        # LIST
+        if cmd == "list":
+            if len(tokens) == 1 or tokens[1] in ("files", "*"):
+                if not self.session_file_list:
+                    print("No session files.")
+                    return True
+                for f in self.session_file_list:
+                    print(f)
+                return True
+
+            target = tokens[1]
+            matches = [f for f in self.session_file_list if f.endswith(target)]
+            if not matches:
+                print(f"No such file in session: {target}")
+                return True
+
+            for f in matches:
+                print(f)
+
+            return True
+
+        return False
+
+
+# ---------- Provider base ----------
 class ai_provider:
     def open_session(self):
         raise NotImplementedError
@@ -831,301 +1275,295 @@ class ai_provider:
     def close_session(self):
         raise NotImplementedError
 
-    def send_message(self, prompt, input_file_list):
+    def send_message(self, prompt, intro_prompt, input_file_list, delete_file_list) -> Tuple[str, int, int, int]:
+        """
+        Sends a message to the AI model.
+        Returns a tuple: (text_response, prompt_tokens, completion_tokens, total_tokens)
+        """
         raise NotImplementedError
 
+    def delete_file(self, local_path: str):
+        """Optional: delete a cloud file corresponding to local_path."""
+        raise NotImplementedError
+
+
+# ---------- Azure provider ----------
 class azure_gateway_provider(ai_provider):
-    def __init__(self, parent):
+    def __init__(self, parent: api_eda_ai_assist):
         self.parent = parent
         self.client = None
         self.chat = None
         self.api_key = parent.cfg["ASH_API_KEY"]
         self.model = parent.cfg["ASH_MODEL"]
-        self.session_file_list = []
+        # (local_path, cloud_name) - cloud_name is purely for tracking, not actual Azure object
+        self._session_files: List[tuple[str, str]] = []
+        self.history: List[Dict[str, str]] = [] # Azure uses its own history tracking
         self.debug = parent.debug
 
-    def open_session( self ):
+    def open_session(self):
         if self.debug:
-            print("open_session(azure_gateway:%s)" % self.model )
-#       from openai import AzureOpenAI
-#       self.client = AzureOpenAI( azure_endpoint= self.parent.cfg["ASH_ENDPOINT"],
-#                                  api_key=        self.parent.cfg["ASH_API_KEY"],
-#                                  api_version=    self.parent.cfg["ASH_API_VERSION"] )
-#       self.chat = self.client.chat
- 
-        self.intro   = [ {"role": "system", "content": "You are a concise, helpful assistant."} ]
-        self.history = []
- 
-    def close_session( self ):
+            print("open_session(azure_gateway:%s)" % self.model)
+        from openai import AzureOpenAI
+
+        self.client = AzureOpenAI(
+            azure_endpoint=self.parent.cfg["ASH_ENDPOINT"],
+            api_key=self.parent.cfg["ASH_API_KEY"],
+            api_version=self.parent.cfg["ASH_API_VERSION"],
+        )
+        self.chat = self.client.chat
+        self.history = [] # Reset history on new session
+
+    def close_session(self):
         if self.debug:
             print("close_session(azure_gateway)")
+        self._session_files.clear() # Clear internal file list on close
+        self.history.clear() # Clear chat history as well
 
-    def send_message(self, prompt, input_file_list ):
+    def delete_file(self, local_path: str):
+        # For Azure, "cloud files" are just included in prompt content; nothing to delete remotely.
+        # We only need to drop them from our internal list.
+        before = list(self._session_files)
+        self._session_files = [item for item in self._session_files if item[0] != local_path]
+        if self.debug:
+            removed = [p for p, _ in before if p not in [q for q, _ in self._session_files]]
+            if removed:
+                print(f"azure_gateway_provider: removed from _session_files: {removed}")
+        # Also update parent session file list
+        self.parent.session_file_list = [p for p in self.parent.session_file_list if p != local_path]
+
+
+    def send_message(self, prompt, intro_prompt, input_file_list, delete_file_list) -> Tuple[str, int, int, int]:
         message = []
         file_blocks = []
         file_message = None
 
-        # If a file is in the input_file_list and NOT in the session_file_list, upload it and add to session list
-        for each_file in input_file_list:
-            if not any( each_file == item[0] for item in self.session_file_list):
-                name = self.parent.make_ash_cloud_name( each_file ) # Timestamp+CPU_PID+each_name
-                self.session_file_list.append( (each_file, name ))
-        for each_file, name in self.session_file_list:
+        if delete_file_list:
+            # Update provider's internal list of files and parent's list
+            before_provider_files = list(self._session_files)
+            self._session_files = [item for item in self._session_files if item[0] not in delete_file_list]
             if self.debug:
-                print("uploading %s" % each_file )
-            with open( each_file, "r", encoding="utf-8") as f:
-                content = f.read()
-            file_blocks.append(f"=== FILE: {os.path.basename(each_file)} ===\n{content}\n")
-        files_context = "\n".join(file_blocks)
+                removed_provider = [p for p, _ in before_provider_files if p not in [q for q, _ in self._session_files]]
+                if removed_provider:
+                    print(f"azure_gateway_provider: removed from _session_files (due to prompt): {removed_provider}")
+            # The parent's list should also be updated by the api_eda_ai_assist.delete_session_file if called directly.
+            # If AI generates a delete request, we update it here.
+            self.parent.session_file_list = [p for p in self.parent.session_file_list if p not in delete_file_list]
 
-        if self.session_file_list:
-          file_message = f"Here are my files:\n\n{files_context}\n\nAnswer questions using these files and referencing their filenames."
+
+        intro_prompt_message = {"role": "system", "content": intro_prompt}
+        prompt_message = {"role": "user", "content": prompt}
+
+        for each_file in input_file_list:
+            if each_file not in self.parent.session_file_list:
+                self.parent.session_file_list.append(each_file)
+            if not any(each_file == item[0] for item in self._session_files):
+                name = self.parent.make_ash_cloud_name(each_file)
+                self._session_files.append((each_file, name))
+
+        for each_file, name in self._session_files:
+            if os.path.exists(each_file):
+                try:
+                    size_bytes = os.path.getsize(each_file)
+                    size_mb = size_bytes / (1024 * 1024)
+                    size_str = f"{size_mb:,.1f} MB"
+                except Exception:
+                    size_str = "unknown size"
+                if self.debug:
+                    print(f"uploading {each_file} ({size_str})")
+                with open(each_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+                file_blocks.append(f"=== FILE: {os.path.basename(each_file)} ===\n{content}\n")
+
+        files_context = "\n".join(file_blocks)
+        if self._session_files:
+            file_message = f"Here are my files:\n\n{files_context}\n\nAnswer questions using these files and referencing their filenames."
 
         if file_message:
-            message.append({"role": "user", "content": file_message })
-        message += [ self.intro ]
+            message.append({"role": "user", "content": file_message})
+        message += [intro_prompt_message]
         message += self.history
-        prompt_message = {"role": "user", "content": prompt}
-#       response = self.chat.completions.create( model=self.model, messages= message )
-#       answer = response.choices[0].message.content
-        if self.debug:
-            print( message )
-        answer = "A:" + str( prompt )
-        self.history.append( prompt_message )
-        self.history.append({"role": "assistant", "content": answer})
-        return answer
+        message += [prompt_message]
+
+        try:
+            response = self.chat.completions.create(model=self.model, messages=message)
+            answer = response.choices[0].message.content
+            if self.debug:
+                print(message)
+
+            self.history.append(prompt_message)
+            self.history.append({"role": "assistant", "content": answer})
+
+            # Extract raw usage numbers
+            prompt_tokens = 0
+            completion_tokens = 0
+            total_tokens = 0
+            if response.usage:
+                prompt_tokens = response.usage.prompt_tokens
+                completion_tokens = response.usage.completion_tokens
+                total_tokens = response.usage.total_tokens
+            elif self.debug:
+                print("Warning: Azure API response did not contain usage information.", file=sys.stderr)
+
+            return answer, prompt_tokens, completion_tokens, total_tokens
+        except Exception as e:
+            error_message = f"AI error (Azure): {type(e).__name__}: {e}"
+            print(error_message, file=sys.stderr)
+            return error_message, 0, 0, 0 # Return 0 tokens on error
 
 
+# ---------- Gemini provider ----------
 class gemini_provider(ai_provider):
-    def __init__(self, parent):
+    def __init__(self, parent: api_eda_ai_assist):
         self.parent = parent
         self.client = None
         self.chat = None
         self.api_key = parent.cfg["ASH_API_KEY"]
         self.model = parent.cfg["ASH_MODEL"]
-        self.session_file_list = []
+        # (local_path, uploaded_file_object)
+        self._session_files: List[tuple[str, object]] = []
         self.debug = parent.debug
 
-    def open_session( self ):
+    def open_session(self):
         if self.debug:
-            print("open_session(gemini:%s)" % self.model )
+            print("open_session(gemini:%s)" % self.model)
         from google import genai
- 
-        # If api_key is None, the client auto‑reads GEMINI_API_KEY
+
         if self.api_key:
             self.client = genai.Client(api_key=self.api_key)
         else:
-            self.client = genai.Client()  # auto-reads GEMINI_API_KEY
+            self.client = genai.Client()
         self.chat = self.client.chats.create(model=self.model)
 
-    def close_session( self ):
+    def close_session(self):
         if self.debug:
             print("close_session(gemini)")
-            print("Current Files:")
-        for file in self.client.files.list():
-            # Name: files/2qgse62no0hh | Display Name: None | URI: https://generativelanguage.googleapis.com/v1beta/files/2qgse62no0hh
-            print(f"- Name: {file.name} | Display Name: {file.display_name} | URI: {file.uri}")
+            print("Current Gemini cloud files:")
+        for local_path, uploaded_file_obj in self._session_files:
+            if self.debug:
+                print(
+                    f"- Name: {uploaded_file_obj.name} | Display Name: {uploaded_file_obj.display_name} | URI: {uploaded_file_obj.uri}"
+                )
             try:
-                self.client.files.delete(name = file.name )
+                self.client.files.delete(name=uploaded_file_obj.name)
                 if self.debug:
-                    print("File deleted successfully.")
-            except:
+                    print(f"File {local_path} deleted successfully from Gemini Files API.")
+            except Exception as e:
                 if self.debug:
-                    print("Failed to delete.")
+                    print(f"Warning: Failed to delete {local_path} (cloud name {uploaded_file_obj.name}) from Gemini Files API: {e}", file=sys.stderr)
+        self._session_files.clear()
+        self.chat = None # Invalidate chat object
 
-    def send_message(self, prompt, input_file_list ):
+    def delete_file(self, local_path: str):
+        client = self.client
+        remaining = []
+        found_and_deleted = False
+        for lp, obj in self._session_files:
+            if lp == local_path:
+                try:
+                    client.files.delete(name=obj.name)
+                    if self.debug:
+                        print(f"Deleted cloud file {obj.display_name} (local: {lp}) via Gemini API.")
+                    found_and_deleted = True
+                except Exception as e:
+                    if self.debug:
+                        print(f"Warning: Failed to delete cloud file {obj.display_name} (local: {lp}): {e}", file=sys.stderr)
+                    remaining.append((lp, obj)) # If deletion fails, keep it in internal list
+            else:
+                remaining.append((lp, obj))
+        self._session_files = remaining
+        if found_and_deleted:
+            self.parent.session_file_list = [p for p in self.parent.session_file_list if p != local_path]
+
+
+    def send_message(self, prompt, intro_prompt, input_file_list, delete_file_list) -> Tuple[str, int, int, int]:
         if self.debug:
-            print("send_message(gemini) %s" % prompt )
+            print("send_message(gemini) %s" % prompt)
         client = self.client
         chat = self.chat
-        session_file_list = self.session_file_list
 
-        # If a file is in the input_file_list and NOT in the session_file_list, upload it and add to session list
+        if delete_file_list:
+            for path in delete_file_list:
+                self.delete_file(path) # This updates both provider and parent's session_file_list
+
         for each_file in input_file_list:
-            if not any( each_file == item[0] for item in session_file_list):
+            if each_file not in self.parent.session_file_list:
+                self.parent.session_file_list.append(each_file)
+            if not any(each_file == item[0] for item in self._session_files):
+                if not os.path.exists(each_file):
+                    print(f"Warning: Attempted to upload non-existent file: {each_file}", file=sys.stderr)
+                    continue # Skip this file
+
                 if self.debug:
                     print(f"Attempting to Upload file '{each_file}'")
-                # 1. Upload each file using the Files API
-                name = self.parent.make_ash_cloud_name( each_file ) # Timestamp+CPU_PID+each_name
-                uploaded_file = client.files.upload(file=each_file, config={'mime_type':'text/plain', 'display_name':name})
-                if self.debug:
-                    print(f"Uploaded file '{each_file}' as: {uploaded_file.name}") # Uploaded file 'foo.txt' as: files/bd0blct1aolk
-                session_file_list.append( (each_file, uploaded_file ))
+                name = self.parent.make_ash_cloud_name(each_file)
+                try:
+                    uploaded_file = client.files.upload(
+                        file=each_file,
+                        config={"mime_type": "text/plain", "display_name": name},
+                    )
+                    if self.debug:
+                        print(f"Uploaded file '{each_file}' as: {uploaded_file.name}")
+                    self._session_files.append((each_file, uploaded_file))
+                except Exception as e:
+                    print(f"Error uploading file '{each_file}' to Gemini: {e}", file=sys.stderr)
 
-#       # 2. Create the contents list for the prompt using only files in the input_file_list
-#       # It's important to add descriptive text to help the model distinguish between files
-        contents = []; i = 0;
-        if input_file_list:
-            contents.append("Here are files for analysis")
-            for each_file, uploaded_file in session_file_list:
-                if each_file in input_file_list:
-                    contents.append(f"File {i+1} ({os.path.basename( each_file )}):")
-                    contents.append(uploaded_file)
+
+        contents = []
+        contents.append(intro_prompt)
+        if self._session_files: # Only add this block if there are *any* files in session
+            contents.append("Here are files for analysis:")
+            i = 0
+            for each_file, uploaded_file in self._session_files:
+                # Only include files that were explicitly part of the *current prompt's* input_file_list
+                # or all session files? The original code added all _session_files regardless of input_file_list.
+                # Let's stick to the original behavior and include all active session files.
+                contents.append(f"File {i+1} ({os.path.basename(each_file)}):")
+                contents.append(uploaded_file)
+                i += 1
         contents.append(prompt)
 
-#       print("Current Files:")
-#       for file in client.files.list():
-#           # Name: files/2qgse62no0hh | Display Name: None | URI: https://generativelanguage.googleapis.com/v1beta/files/2qgse62no0hh
-#           print(f"- Name: {file.name} | Display Name: {file.display_name} | URI: {file.uri}")
-
-        # print( contents )
-        #['Content of File 1 (foo.txt):', File(
-        #  create_time=datetime.datetime(2026, 2, 12, 18, 40, 47, 491241, tzinfo=TzInfo(0)),
-        #  display_name='foo.txt',
-        #  expiration_time=datetime.datetime(2026, 2, 14, 18, 40, 47, 20205, tzinfo=TzInfo(0)),
-        #  mime_type='text/plain',
-        #  name='files/t9oczyrv66u3',
-        #  sha256_hash='YTg4M2RhZmM0ODBkNDY2ZWUwNGUwZDZkYTk4NmJkNzhlYjFmZGQyMTc4ZDA0NjkzNzIzZGEzYThmOTVkNDJmNA==',
-        #  size_bytes=5,
-        #  source=<FileSource.UPLOADED: 'UPLOADED'>,
-        #  state=<FileState.ACTIVE: 'ACTIVE'>,
-        #  update_time=datetime.datetime(2026, 2, 12, 18, 40, 47, 491241, tzinfo=TzInfo(0)),
-        #  uri='https://generativelanguage.googleapis.com/v1beta/files/t9oczyrv66u3'
-        #), 'Content of File 2 (bar.txt):', File(
-        #    ...
-        #
-        #)]
-
         try:
-            response = chat.send_message( contents )
+            response = chat.send_message(contents)
             if self.debug:
-                print("chat.send_message(gemini) \nQ: %s \nA: %s" % ( contents, response.text.strip() ) )
-            return response.text.strip()
+                print("chat.send_message(gemini) \nQ: %s \nA: %s" % (contents, response.text.strip()))
+            rts = response.text.strip()
+
+            # Extract raw usage numbers
+            prompt_tokens = 0
+            completion_tokens = 0
+            total_tokens = 0
+            if response.usage_metadata:
+                total_tokens = response.usage_metadata.total_token_count
+                prompt_tokens = response.usage_metadata.prompt_token_count
+                completion_tokens = response.usage_metadata.candidates_token_count
+            elif self.debug:
+                print("Warning: Gemini API response did not contain usage information.", file=sys.stderr)
+
+            return rts, prompt_tokens, completion_tokens, total_tokens
         except Exception as e:
-            return f"AI error: {type(e).__name__}: {e}"
+            error_message = f"AI error (Gemini): {type(e).__name__}: {e}"
+            print(error_message, file=sys.stderr)
+            return error_message, 0, 0, 0 # Return 0 tokens on error
 
 
-# ---------- Version ----------
-def print_version( self ):
-    import textwrap
-
-    self.get_env_config()
-    cfg = self.cfg
-
-    version_text = f"""
-    Ash — AI‑Enabled EDA Assistant
-    Version: {ASH_VERSION}
-
-    Ash is a command‑line tool for natural‑language analysis of EDA files.
-    It operates using a site‑assigned API key and a configurable AI model.
-
-    Current Configuration
-      ASH_DIR:          {cfg.get("ASH_DIR")}
-      ASH_PROVIDER:     {cfg.get("ASH_PROVIDER")}
-      ASH_MODEL:        {cfg.get("ASH_MODEL")}
-      ASH_ENDPOINT:     {cfg.get("ASH_ENDPOINT")}
-      ASH_API_VERSION:  {cfg.get("ASH_API_VERSION")}
-      ASH_LOG_DIR:      {cfg.get("ASH_LOG_DIR")}
-      ASH_LOG_IDENTITY: {cfg.get("ASH_LOG_IDENTITY")}
-
-    License
-      This program is free software: you can redistribute it and/or modify
-      it under the terms of the GNU General Public License as published by
-      the Free Software Foundation, version 3 or later.
-
-    Authors
-      Kevin Hubbard — Black Mesa Labs
-      Additional engineering assistance provided by Microsoft Copilot.
-    """
-
-    print(textwrap.dedent(version_text).rstrip())
-
-
-# ---------- Help Manual ----------
-def print_help(self):
-    import textwrap
-
-    self.get_env_config()
-    cfg = self.cfg
-
-    help_text = f"""
-    Usage: ash [options] [command]
-
-    Ash is a command‑line assistant for natural‑language analysis of EDA files.
-    It can execute shell commands or interpret plain‑English requests using the
-    configured AI provider.
-
-    Options:
-      -h, --help        Show this help message and exit
-      -v, --version     Show version and configuration information
-
-    Shell Behavior:
-      • Commands that match executables run in the system shell
-      • Natural‑language requests are routed to the AI engine
-      • Use Ctrl+D on an empty line to enter or exit multi‑line mode
-      • History, bang expansion, and tab completion are supported
-
-    AI Configuration:
-      Provider:    {cfg.get("ASH_PROVIDER")}
-      Model:       {cfg.get("ASH_MODEL")}
-      Endpoint:    {cfg.get("ASH_ENDPOINT")}
-      API Version: {cfg.get("ASH_API_VERSION")}
-      API Key:     {'<set>' if cfg.get('ASH_API_KEY') else '<not set>'}
-
-    File Locations:
-      ASH_DIR:    {cfg.get("ASH_DIR")}
-      Log Dir:    {cfg.get("ASH_LOG_DIR")}
-      Identity:   {cfg.get("ASH_LOG_IDENTITY")}  (username or process)
-
-    Environment Variables:
-      ASH_DIR            Base directory for site configuration
-      ASH_PROVIDER       AI provider name (default: gemini)
-      ASH_MODEL          Model name for the provider
-      ASH_ENDPOINT       Provider API endpoint
-      ASH_API_VERSION    Provider API version
-      ASH_API_KEY        Raw API key (optional if ASH_TOKEN is used)
-      ASH_TOKEN          Encrypted API token (site‑managed)
-      ASH_USER_PROMPT    Optional prefix added to all AI requests
-      ASH_LOG_DIR        Directory for usage logs
-      ASH_LOG_IDENTITY   'username' or 'process'
-
-    Examples:
-      ash
-      ash "summarize file foo.vcd"
-      ash "how many lines are in bar.txt?"
-      ash "compare files foo.vcd bar.vcd"
-    """
-
-    print(textwrap.dedent(help_text).rstrip())
-
-    # Optional site files
-    ash_dir = cfg.get("ASH_DIR")
-    billing_path = os.path.join(ash_dir, "site_billing.txt") if ash_dir != "<not set>" else None
-    restrictions_path = os.path.join(ash_dir, "site_restrictions.txt") if ash_dir != "<not set>" else None
-
-    billing_text = ""
-    restrictions_text = ""
-
-    # Append optional sections
-    if billing_text:
-        print("\nBilling Information (site_billing.txt)")
-        print("--------------------------------------")
-        print(billing_text)
-
-    if restrictions_text:
-        print("\nSite Restrictions (site_restrictions.txt)")
-        print("-----------------------------------------")
-        print(restrictions_text)
-    print()
-
-
-# ---------- Platform Detection ----------
+# ---------- Platform / shell ----------
 def on_windows() -> bool:
     return sys.platform.startswith("win32")
 
-# ---------- Shell Discovery ----------
+
 def find_powershell() -> Optional[str]:
-    # Prefer PowerShell 7+ (pwsh), then Windows PowerShell
     for candidate in ("pwsh", "powershell.exe", "powershell"):
         path = shutil.which(candidate)
         if path:
             return path
-    # Common fallbacks
-    for candidate in (r"C:\Program Files\PowerShell\7\pwsh.exe",
-                      r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"):
+    for candidate in (
+        r"C:\Program Files\PowerShell\7\pwsh.exe",
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+    ):
         if os.path.exists(candidate):
             return candidate
     return None
+
 
 def find_csh() -> Optional[str]:
     path = shutil.which("csh")
@@ -1136,6 +1574,7 @@ def find_csh() -> Optional[str]:
             return candidate
     return None
 
+
 def detect_shell() -> Tuple[ShellType, str]:
     if on_windows():
         ps = find_powershell()
@@ -1143,30 +1582,63 @@ def detect_shell() -> Tuple[ShellType, str]:
             print("Error: PowerShell not found (tried pwsh and powershell.exe).", file=sys.stderr)
             sys.exit(127)
         return "powershell", ps
-    else:
+
+    try:
+        ppid = os.getppid()
+        # On some systems /proc/<pid>/exe is not available or readable. Fallback to common shells.
+        try:
+            exe = os.readlink(f"/proc/{ppid}/exe")
+            shell_path = exe
+            shell_name = os.path.basename(exe)
+        except (FileNotFoundError, PermissionError):
+            shell_name = os.environ.get("SHELL", "bash").split('/')[-1]
+            shell_path = shutil.which(shell_name) or f"/bin/{shell_name}"
+
+
+        if shell_name in ("bash", "zsh", "sh"):
+            return "bash", shell_path
+        if shell_name in ("csh", "tcsh"):
+            return "csh", shell_path
+
+        # Default fallback if detection by ppid/env fails
+        bash = shutil.which("bash")
+        if bash:
+            return "bash", bash
         csh_path = find_csh()
         if not csh_path:
-            print("Error: `csh` not found. Please install C shell (package `csh`) and try again.", file=sys.stderr)
+            print("Error: `bash` or `csh` not found. Please install a shell and try again.", file=sys.stderr)
+            sys.exit(127)
+        return "csh", csh_path
+    except Exception:
+        # Generic fallback for unexpected errors
+        bash = shutil.which("bash")
+        if bash:
+            return "bash", bash
+        csh_path = find_csh()
+        if not csh_path:
+            print("Error: `bash` or `csh` not found. Please install a shell and try again.", file=sys.stderr)
             sys.exit(127)
         return "csh", csh_path
 
-# ---------- Prompt ----------
-def format_prompt(buffering_ai, buffering_ai_ctrl_d_hint_sent ) -> str:
-    if buffering_ai:
-      prompt = "...> "
-      if not buffering_ai_ctrl_d_hint_sent:
-        prompt = "(Ctrl+D to send)\n"+prompt
-      return prompt
-    cwd = truncate_string(os.getcwd())
-#   return f"{PROMPT_COLOR}{cwd}{RESET_COLOR} % "
-    return f"[ash]:{cwd}% "
 
+# ---------- Prompt ----------
 def truncate_string(input_string, max_length=30):
-    # Truncates a string to the last 'max_length' characters if it's longer.
     if len(input_string) > max_length:
         return input_string[-max_length:]
     else:
         return input_string
+
+
+def format_prompt(buffering_ai, buffering_ai_ctrl_d_hint_sent) -> str:
+    if buffering_ai:
+        prompt = "...> "
+        if not buffering_ai_ctrl_d_hint_sent:
+            prompt = "(Ctrl+D to send)\n" + prompt
+#       return PROMPT_COLOR + prompt + RESET_COLOR
+        return prompt
+    cwd = truncate_string(os.getcwd())
+#   return f"{PROMPT_COLOR}[ash]:{cwd}% {RESET_COLOR}"
+    return f"[ash]:{cwd}%"
 
 
 # ---------- Built-in cd ----------
@@ -1184,26 +1656,46 @@ def handle_cd(arg_str: str) -> None:
     except Exception as exc:
         print(f"cd: {exc}", file=sys.stderr)
 
+
 # ---------- Command Execution ----------
-def run_shell_command(shell_type: ShellType, shell_path: str, command: str) -> int:
-    if shell_type == "powershell":
-        argv = [shell_path, "-NoLogo", "-NoProfile", "-Command", command]
-    else:
+def run_shell_command(shell_type: str, shell_path: str, command: str) -> int:
+    import subprocess as _subprocess
+
+    shell_name = os.path.basename(shell_path)
+
+    if shell_name in ("bash", "zsh", "sh"):
+        wrapped = (
+            "shopt -s expand_aliases 2>/dev/null; "
+            "[ -f ~/.bashrc ] && source ~/.bashrc; "
+            "[ -f ~/.bash_aliases ] && source ~/.bash_aliases; "
+            f"{command}"
+        )
+        argv = [shell_path, "-c", wrapped]
+
+    elif shell_name in ("csh", "tcsh"):
         argv = [shell_path, "-c", command]
+
+    elif shell_name in ("pwsh", "powershell.exe"):
+        argv = [shell_path, "-NoLogo", "-Command", f"& {{ {command} }}"]
+
+    else:
+        print(f"Warning: Unknown shell type '{shell_type}', executing command directly with {shell_path}.", file=sys.stderr)
+        argv = [shell_path, "-c", command]
+
     try:
-        completed = subprocess.run(
+        completed = _subprocess.run(
             argv,
-            stdin=None,
+            stdin=_subprocess.DEVNULL, # Ensure child process doesn't inherit stdin for non-interactive commands
             stdout=sys.stdout,
             stderr=sys.stderr,
             cwd=os.getcwd(),
             env=os.environ.copy(),
-            text=False,
-            check=False
+            text=False, # Use bytes for stdin/stdout to avoid encoding issues with raw shell output
+            check=False,
         )
         return completed.returncode
     except FileNotFoundError:
-        print(f"Error: shell not found while executing: {shell_path}", file=sys.stderr)
+        print(f"Error: Shell executable not found: {shell_path}", file=sys.stderr)
         return 127
     except KeyboardInterrupt:
         print()
@@ -1212,9 +1704,9 @@ def run_shell_command(shell_type: ShellType, shell_path: str, command: str) -> i
         print(f"Execution error: {exc}", file=sys.stderr)
         return 1
 
+
 # ---------- History & Completion ----------
 def get_path_executables() -> List[str]:
-    """Return a list of executable names found in PATH (basename only)."""
     exes = set()
     path_env = os.environ.get("PATH", "")
     sep = ";" if on_windows() else ":"
@@ -1224,56 +1716,75 @@ def get_path_executables() -> List[str]:
         try:
             for name in os.listdir(p):
                 full = os.path.join(p, name)
-                if os.path.isfile(full) and os.access(full, os.X_OK):
+                # Check if it's a file and executable (for POSIX) or just a file (for Windows, where .exe suffices)
+                if os.path.isfile(full) and (os.access(full, os.X_OK) or on_windows()):
+                    # On Windows, add common extensions if not present to match shell behavior
+                    if on_windows() and not any(name.lower().endswith(ext) for ext in ('.exe', '.cmd', '.bat', '.ps1')):
+                        continue
                     exes.add(name)
         except Exception:
             continue
     return sorted(exes)
 
+
 def _get_history_list() -> List[str]:
-    """
-    Return a list of history lines in order (oldest -> newest).
-    Use readline if available; otherwise return INMEM_HISTORY.
-    """
     if _readline_available:
         try:
             import readline  # type: ignore
-            return [readline.get_history_item(i + 1)
-                    for i in range(readline.get_current_history_length())]
+
+            return [
+                readline.get_history_item(i + 1)
+                for i in range(readline.get_current_history_length())
+                if readline.get_history_item(i + 1) is not None
+            ]
         except Exception:
             pass
     return INMEM_HISTORY[:]
 
+
 def _init_readline():
-    """
-    Initialize readline/pyreadline3 if available.
-    - Load history file into readline AND INMEM_HISTORY
-    - Configure tab completion
-    """
     global _readline_available, _history_loaded, _win_completion_active
     _readline_available = False
     _history_loaded = False
     _win_completion_active = False
 
-    # Try to import readline (POSIX) or pyreadline3's readline (Windows)
     try:
         import readline  # type: ignore
+
         _readline_available = True
-    except Exception:
+    except ImportError:
+        # Fallback for Windows if pyreadline3 is not installed
+        if on_windows():
+            try:
+                import pyreadline3 as readline # type: ignore
+                _readline_available = True
+                _win_completion_active = True
+            except ImportError:
+                _readline_available = False
+        else:
+            _readline_available = False
+    except Exception as e:
+        print(f"Warning: readline initialization failed: {e}", file=sys.stderr)
         _readline_available = False
 
     if _readline_available:
-        import readline  # type: ignore
-
-        # Load history file, if present
         try:
+            # Re-import to ensure it's the correct readline module (pyreadline3 or native)
+            if on_windows() and not _win_completion_active: # if native readline failed but pyreadline3 might work
+                import pyreadline3 as readline # type: ignore
+                _win_completion_active = True
+            elif not on_windows() or _win_completion_active: # if already determined to be available
+                import readline # type: ignore
+            else:
+                raise ImportError("No suitable readline module found.")
+
             if os.path.exists(HISTORY_FILE):
                 readline.read_history_file(HISTORY_FILE)
                 _history_loaded = True
-        except Exception:
+        except Exception as e:
+            print(f"Warning: Failed to load history file: {e}", file=sys.stderr)
             pass
 
-        # Sync readline's history into our in-memory mirror
         try:
             INMEM_HISTORY.clear()
             for i in range(readline.get_current_history_length()):
@@ -1283,34 +1794,43 @@ def _init_readline():
         except Exception:
             pass
 
-        # Set history length
         try:
             readline.set_history_length(HISTORY_LIMIT)
         except Exception:
             pass
 
-        # Configure tab completion
         try:
             executables_cache = get_path_executables()
-
+            
+            # Add builtin commands for completion
+            BUILTIN_COMMANDS = ["cd", "exit", "quit", "history", "status", "flush", "restart", "list", "delete"]
+            
             def complete(text, state):
                 buffer = readline.get_line_buffer()
                 cursor = readline.get_endidx()
+                
+                # If completing at the very start of the line or the first token
+                is_first_token = True
                 try:
                     lex = shlex.split(buffer[:cursor])
-                    at_start = (len(lex) == 0) or (
-                        buffer.strip()
-                        and buffer.strip() == lex[0]
-                        and cursor <= len(lex[0])
-                    )
-                except Exception:
+                    if len(lex) > 1:
+                        is_first_token = False
+                    elif len(lex) == 1 and buffer[cursor-1] != ' ' and buffer[cursor-1] != '\t':
+                        # If cursor is within the first token
+                        is_first_token = True 
+                    else: # empty or space after first token
+                        is_first_token = False
+                except ValueError: # Malformed input, try simpler split
                     parts = buffer[:cursor].split()
-                    at_start = (len(parts) <= 1)
+                    is_first_token = len(parts) <= 1
 
                 candidates: List[str] = []
-                if at_start:
+                
+                if is_first_token:
+                    candidates.extend(BUILTIN_COMMANDS)
                     candidates.extend(executables_cache)
 
+                # File/directory completion
                 pattern = os.path.expandvars(os.path.expanduser(text)) + "*"
                 matches = glob.glob(pattern)
                 for m in matches:
@@ -1319,10 +1839,9 @@ def _init_readline():
                         display += os.sep
                     candidates.append(display)
 
-                # Deduplicate while preserving order; filter by startswith(text)
                 seen = set()
                 ordered = []
-                for c in candidates:
+                for c in sorted(candidates): # Sort for consistent order
                     if c not in seen and c.startswith(text):
                         seen.add(c)
                         ordered.append(c)
@@ -1332,15 +1851,15 @@ def _init_readline():
                 return None
 
             readline.set_completer(complete)
-            if on_windows():
-                _win_completion_active = True
-            else:
+            if on_windows() and _win_completion_active: # pyreadline3 binds Tab automatically
+                pass 
+            elif not on_windows(): # native readline needs explicit binding
                 readline.parse_and_bind("tab: complete")
-        except Exception:
+        except Exception as e:
+            print(f"Warning: Failed to set up tab completion: {e}", file=sys.stderr)
             pass
 
-    else:
-        # No readline: preload existing history file into INMEM_HISTORY (if any)
+    else: # If readline is not available
         try:
             if os.path.exists(HISTORY_FILE):
                 with open(HISTORY_FILE, "r", encoding="utf-8", errors="ignore") as f:
@@ -1349,15 +1868,12 @@ def _init_readline():
                         if line:
                             INMEM_HISTORY.append(line)
                 _history_loaded = True
-        except Exception:
+        except Exception as e:
+            print(f"Warning: Failed to load history file (no readline): {e}", file=sys.stderr)
             pass
 
+
 def _save_history():
-    """
-    Persist history to HISTORY_FILE.
-    If readline is available, let it write the file.
-    Otherwise, write INMEM_HISTORY ourselves (preserve order, truncate to limit).
-    """
     try:
         os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
     except Exception:
@@ -1365,35 +1881,29 @@ def _save_history():
 
     if _readline_available:
         try:
-            import readline  # type: ignore
+            import readline # type: ignore
             readline.set_history_length(HISTORY_LIMIT)
             readline.write_history_file(HISTORY_FILE)
             return
-        except Exception:
-            pass  # fall through
+        except Exception as e:
+            print(f"Warning: Failed to save readline history: {e}", file=sys.stderr)
+            pass
 
-    # Manual write from INMEM_HISTORY (preserve order)
     try:
         start = max(0, len(INMEM_HISTORY) - HISTORY_LIMIT)
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
             for item in INMEM_HISTORY[start:]:
                 f.write(item + "\n")
-    except Exception:
+    except Exception as e:
+        print(f"Warning: Failed to save in-memory history: {e}", file=sys.stderr)
         pass
+
 
 # ---------- Bang expansion ----------
 BANG_RE = re.compile(r"^!(.+)$")
 
+
 def expand_bang(line: str) -> str:
-    """
-    Perform bash-like history expansion on a single line.
-    Supported:
-      !!      -> last command
-      !-n     -> nth previous command (e.g., !-2)
-      !n      -> absolute command number (1-based)
-      !prefix -> most recent command starting with 'prefix'
-    Returns expanded line; raises ValueError on failure.
-    """
     m = BANG_RE.match(line.strip())
     if not m:
         return line
@@ -1403,10 +1913,10 @@ def expand_bang(line: str) -> str:
     if not hist:
         raise ValueError("event not found: history is empty")
 
-    if token == "!":            # '!!'
+    if token == "!":
         return hist[-1]
 
-    if token.startswith("-"):   # '!-n'
+    if token.startswith("-"):
         try:
             n = int(token[1:])
             if n <= 0 or n > len(hist):
@@ -1415,13 +1925,12 @@ def expand_bang(line: str) -> str:
             raise ValueError(f"bad event specification: !{token}")
         return hist[-n]
 
-    if token.isdigit():         # '!n' (1-based index into wrapper history)
+    if token.isdigit():
         idx = int(token)
         if idx <= 0 or idx > len(hist):
             raise ValueError(f"event not found: !{token}")
         return hist[idx - 1]
 
-    # '!prefix' -> last command starting with prefix
     prefix = token
     for cmd in reversed(hist):
         if cmd.startswith(prefix):
@@ -1429,64 +1938,57 @@ def expand_bang(line: str) -> str:
 
     raise ValueError(f"event not found: !{token}")
 
+
 # ---------- Built-in 'history' ----------
 def print_history():
-    """Print wrapper history with 1-based indices (oldest → newest)."""
     hist = _get_history_list()
     for i, cmd in enumerate(hist, start=1):
         print(f"{i:5d}  {cmd}")
 
-# --- Main REPL (Read-Eval-Print Loop) ---
+
+# ---------- Main REPL ----------
 def main():
     ai = api_eda_ai_assist()
     shell_type, shell_path = detect_shell()
-    provider = None
     buffering_ai_ctrl_d_hint_sent = False
     buffering_ai = False
-    paste_buffer = []  
-    BLOCK_INTRO_RE = None
-    full_prompt = None
+    paste_buffer: List[str] = []
 
     _init_readline()
-    if on_windows() and not _readline_available:
-        print("Note: Tab completion not available. Install `pyreadline3` (pip install pyreadline3) for Windows completion.")
 
-    # Let child processes receive SIGINT; keep wrapper alive
     try:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
     except Exception:
         pass
 
     if "--help" in sys.argv or "-h" in sys.argv:
-        print_help( ai )
+        ai.print_help()
         return
 
     if "--version" in sys.argv or "-v" in sys.argv:
-        print_version( ai )
+        ai.print_version()
         return
 
-
-    # If arguments were passed, run in "one-shot" mode 
-    if len(sys.argv) > 1: # Example: python ash.py analyze foo.txt 
-        line = " ".join(sys.argv[1:]) 
-        api_key = None
-        ai.open_ai_session();
-        rts = ai.ask_ai( line )
-        print( rts )
-        if ai.provider:
-            ai.close_ai_session();
+    if len(sys.argv) > 1:
+        line = " ".join(sys.argv[1:])
+        ai.open_ai_session()
+        if ai.provider: # Check if session opened successfully
+            rts, warnings = ai.ask_ai(line)
+            print(rts)
+            for w in warnings:
+                print(f"[warning] {w}")
+            ai.print_session_status()
+            ai.close_ai_session()
+        else:
+            print("Failed to initialize AI session for one-shot command.", file=sys.stderr)
         return
 
-#   banner = f"{shell_type} wrapper (using {shell_path}). Type `history`, `exit`, or press Ctrl+C to quit."
-#   print(banner)
-#                                                                                         #  
-    print("------------------------------------------------------------------------")
-    print("Hi, I'm Ash (eda_ai_assist), your cloud‑based AI EDA assistant.         ")
-    print("From your shell, I interpret plain‑English and analyze your EDA files.  ")
-    print("I became operational at Black Mesa Labs on February 8th, 2026.          ")
-    print("Press Ctrl+D on an empty line to enter or exit multi‑line input mode.   ")
-    print("------------------------------------------------------------------------")
-
+    print("-------------------------------------------------------------------------------")
+    print("Hi, I'm Ash (eda_ai_assist), your cloud AI electrical-engineering assistant.   ")
+    print("Within your own shell, I interpret plain-English and analyze your EDA files.   ")
+    print("I became operational at Black Mesa Labs in Sammamish, WA on February 8th, 2026.")
+    print("Press Ctrl+D on an empty line to enter or exit multi-line input mode.          ")
+    print("-------------------------------------------------------------------------------")
 
     while True:
         try:
@@ -1495,29 +1997,36 @@ def main():
             except Exception:
                 pass
             try:
-                line = input(format_prompt(buffering_ai,buffering_ai_ctrl_d_hint_sent ))
+                line = input(format_prompt(buffering_ai, buffering_ai_ctrl_d_hint_sent))
                 if buffering_ai:
-                  buffering_ai_ctrl_d_hint_sent = True
+                    buffering_ai_ctrl_d_hint_sent = True
                 else:
-                  buffering_ai_ctrl_d_hint_sent = False
+                    buffering_ai_ctrl_d_hint_sent = False
             except EOFError:
-               # Ctrl-D pressed on an empty line
                 if not buffering_ai:
-                    # Enter buffering mode
                     buffering_ai = True
                     paste_buffer = []
                     print("(Begin Buffering. Type your prompt and paste your data. Ctrl+D again to finish.)")
                     continue
                 else:
-                    # Exit buffering mode and send
                     buffering_ai = False
-                    full_prompt = "\n".join(paste_buffer)
+                    full_prompt_from_buffer = "\n".join(paste_buffer)
                     paste_buffer = []
-                    if not ai.provider:
-                        print("ai.open_ai_session()")
+                    if not full_prompt_from_buffer.strip():
+                        print("Empty buffered input ignored.")
+                        continue
+                    if not ai.provider: # Open session if not already open (e.g., first AI command)
                         ai.open_ai_session()
-                    rts = ai.ask_ai(full_prompt)
-                    print(rts)
+                    if ai.provider: # Proceed only if session is active
+                        rts, warnings = ai.ask_ai(full_prompt_from_buffer)
+                        print(rts)
+                        for w in warnings:
+                            print(f"[warning] {w}")
+                        if not ai.provider:
+                            return # Handles special hard-limit reached closed session case
+                        ai.print_session_status()
+                    else:
+                        print("AI session is not active. Cannot process buffered input.", file=sys.stderr)
                     continue
 
             if not line.strip():
@@ -1530,15 +2039,12 @@ def main():
             print()
             continue
 
-        # If we are already buffering an AI request, ALL lines go to the buffer 
-        if buffering_ai: 
-            paste_buffer.append(line) 
+        if buffering_ai:
+            paste_buffer.append(line)
             continue
 
-        # Mirror raw input into in-memory history so bang expansion sees it
         if line.strip():
             INMEM_HISTORY.append(line)
-            # Also push into readline history (if available)
             if _readline_available:
                 try:
                     import readline  # type: ignore
@@ -1546,7 +2052,6 @@ def main():
                 except Exception:
                     pass
 
-        # Ignore SIGINT while executing; child receives it
         try:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
         except Exception:
@@ -1554,52 +2059,87 @@ def main():
 
         stripped = line.strip()
 
-        # Exit conditions
-        if stripped in {"exit", "quit"} :
+        if stripped in {"exit", "quit"}:
             break
 
-        # Built-in 'history' (show wrapper's numbering)
+        if stripped in ("restart", "restart session", "new session", "reset", "flush"):
+            if ai.provider:
+                ai.close_ai_session() # This also resets the global token counters and provider
+            ai.open_ai_session() # This ensures a fresh session and provider
+            if ai.provider:
+                print("AI session restarted.")
+            else:
+                print("Failed to restart AI session.", file=sys.stderr)
+            continue
+
         if stripped == "history" and not buffering_ai:
             print_history()
             continue
 
-        # Bang expansion (before cd / external execution)
+        if stripped == "status" and not buffering_ai:
+            if not ai.provider:
+                print("AI provider not initialized. Use 'restart' to open a session.")
+                # ai.open_ai_session() # Don't auto-open on status, user should manage
+            ai.print_session_status()
+            continue
+
         try:
             expanded = expand_bang(line)
             if expanded != line:
-                print(expanded)  # echo like bash does
+                print(expanded)
             line = expanded
             stripped = line.strip()
         except ValueError as e:
-            print(str(e))
+            print(str(e), file=sys.stderr)
             continue
 
-        # Built-in cd
-        if stripped.startswith("cd") :
-            parts = stripped.split(maxsplit=1)
-            arg = parts[1] if len(parts) == 2 else ""
+        if stripped.startswith("cd"):
+            rest = stripped[len("cd"):].lstrip()
+            # Handle possible shell command separators after cd argument
+            for sep in (";", "&&", "||", "|", ">", "<"):
+                i = rest.find(sep)
+                if i != -1:
+                    rest = rest[:i].strip()
+                    break
+            try:
+                # Use shlex.split for robust parsing of quotes etc.
+                toks = shlex.split(rest)
+                arg = toks[0] if toks else ""
+            except Exception:
+                # Fallback for simpler cases if shlex fails (e.g., unbalanced quotes)
+                arg = rest.split()[0] if rest else ""
             handle_cd(arg)
             continue
 
-        # Normal single-line AI request
-        if ai.is_ai_request(line):
-            if not ai.provider:
-                print("ai.open_ai_session()")
-                ai.open_ai_session()
-            rts = ai.ask_ai(line)
-            print(rts)
+        # 1. Built-in file commands
+        if ai.handle_file_commands(line):
             continue
-         
-        # Delegate to the detected shell
-        print("OS_CALL: %s" % line )
+
+        # 2. AI request
+        if ai.is_ai_request(line):
+            if not ai.provider: # Open session if not already open (e.g., first AI command)
+                ai.open_ai_session()
+            if ai.provider: # Proceed only if session is active
+                rts, warnings = ai.ask_ai(line)
+                print(rts)
+                for w in warnings:
+                    print(f"[warning] {w}")
+                if not ai.provider:
+                    return # Handles special hard-limit reached closed session case
+                ai.print_session_status()
+            else:
+                print("AI session is not active. Cannot process AI request.", file=sys.stderr)
+            continue
+
+        # 3. Shell command
         _ = run_shell_command(shell_type, shell_path, line)
-        
 
     if ai.provider:
-        ai.close_ai_session();
+        ai.close_ai_session()
 
     _save_history()
     print("Bye.")
+
 
 if __name__ == "__main__":
     main()
